@@ -12,6 +12,8 @@ const EXPECTED_TOOLS = [
   "preview_data",
   "get_data_page",
   "get_complete_data",
+  "get_data_series",
+  "quota_status",
   "get_dictionary",
 ];
 
@@ -27,7 +29,7 @@ test("initialize negotiates protocol version and advertises tools", async () => 
   assert.equal(unknown.body.result.protocolVersion, "2025-06-18");
 });
 
-test("tools/list returns all ten read-only tools with schemas", async () => {
+test("tools/list returns all twelve read-only tools with schemas", async () => {
   const { rpc } = setup();
   const { body } = await rpc("tools/list");
   const names = body.result.tools.map((t: { name: string }) => t.name);

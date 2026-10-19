@@ -12,12 +12,14 @@ export type ErrorCode =
 export type ToolErrorOptions = {
   hint?: string;
   retryAfterSeconds?: number;
+  details?: Record<string, unknown>;
 };
 
 export class ToolError extends Error {
   code: ErrorCode;
   hint?: string;
   retryAfterSeconds?: number;
+  details?: Record<string, unknown>;
 
   constructor(code: ErrorCode, message: string, options: ToolErrorOptions = {}) {
     super(message);
@@ -25,6 +27,7 @@ export class ToolError extends Error {
     this.code = code;
     this.hint = options.hint;
     this.retryAfterSeconds = options.retryAfterSeconds;
+    this.details = options.details;
   }
 
   toJSON() {
@@ -33,6 +36,7 @@ export class ToolError extends Error {
       message: this.message,
       ...(this.hint ? { hint: this.hint } : {}),
       ...(this.retryAfterSeconds !== undefined ? { retry_after_seconds: this.retryAfterSeconds } : {}),
+      ...(this.details ?? {}),
     };
   }
 }

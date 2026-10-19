@@ -9,8 +9,11 @@ export type RateDecision =
   | { allowed: true }
   | { allowed: false; bucket: string; retryAfterSeconds: number };
 
+export type RateUsage = { bucket: string; hits: number; resetAfterSeconds: number };
+
 export interface RateLimiter {
   consume(rules: RateRule[]): Promise<RateDecision>;
+  peek(rules: RateRule[]): Promise<RateUsage[] | undefined>;
 }
 
 type FetchFn = typeof fetch;
@@ -82,6 +85,25 @@ export function createSupabaseStore(supabaseUrl: string, serviceKey: string, fet
       } catch (err) {
         console.error("rate limiter error", err);
         return { allowed: true };
+      }
+    },
+    async peek(rules: RateRule[]) {
+      try {
+        const res = await fetchImpl(`${base}/rpc/mcp_peek_rate_limit`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ p_buckets: rules.map((r) => r.bucket), p_windows: rules.map((r) => r.windowSeconds) }),
+        });
+        if (!res.ok) {
+          console.error("rate limit peek failed", res.status);
+          return undefined;
+        }
+        const out = await res.json() as { bucket: string; hits: number; reset_after_seconds: number }[];
+        if (!Array.isArray(out)) return undefined;
+        return out.map((u) => ({ bucket: String(u.bucket), hits: Number(u.hits) || 0, resetAfterSeconds: Number(u.reset_after_seconds) || 0 }));
+      } catch (err) {
+        console.error("rate limit peek error", err);
+        return undefined;
       }
     },
   };

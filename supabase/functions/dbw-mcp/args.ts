@@ -63,6 +63,41 @@ export function matchesQuery(text: string, query: string | undefined): boolean {
   return normalizeText(query).split(/\s+/).filter(Boolean).every((word) => haystack.includes(word));
 }
 
+// Polish words inflect at the end (bezrobocie / bezrobotni, wynagrodzenia / wynagrodzenie), so loose matching
+// compares a shortened stem of each query word.
+function stem(word: string): string {
+  return word.length <= 4 ? word : word.slice(0, Math.max(4, word.length - 3));
+}
+
+export function matchesLoosely(text: string, query: string | undefined): boolean {
+  if (!query) return true;
+  const haystack = normalizeText(text);
+  return normalizeText(query).split(/\s+/).filter(Boolean).every((word) => haystack.includes(stem(word)));
+}
+
+export function intListArg(args: Args, name: string, options: { min: number; max: number; maxItems: number }) {
+  const value = args[name];
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length === 0) invalid(`"${name}" must be a non-empty list of integers.`);
+  if (value.length > options.maxItems) invalid(`"${name}" can have at most ${options.maxItems} items.`);
+  for (const v of value) {
+    if (typeof v !== "number" || !Number.isInteger(v) || v < options.min || v > options.max) {
+      invalid(`"${name}" must contain integers between ${options.min} and ${options.max}.`);
+    }
+  }
+  return [...new Set(value as number[])];
+}
+
+export function strListArg(args: Args, name: string, maxItems: number) {
+  const value = args[name];
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string" || !v.trim())) {
+    invalid(`"${name}" must be a non-empty list of strings.`);
+  }
+  if (value.length > maxItems) invalid(`"${name}" can have at most ${maxItems} items.`);
+  return [...new Set((value as string[]).map((v) => v.trim()))];
+}
+
 export function paginate<T>(items: T[], offset: number, limit: number) {
   const page = items.slice(offset, offset + limit);
   const nextOffset = offset + page.length < items.length ? offset + page.length : null;

@@ -3,13 +3,16 @@ import type { RateLimiter, RateRule } from "./store.ts";
 import type { ToolContext, ToolDefinition } from "./tools.ts";
 
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-export const SERVER_INFO = { name: "dbw-statistics-poland", title: "Statistics Poland DBW", version: "1.0.0" };
+export const SERVER_INFO = { name: "dbw-statistics-poland", title: "Statistics Poland DBW", version: "1.1.0" };
 const MAX_BODY_BYTES = 64 * 1024;
 
 const INSTRUCTIONS =
   "Tools for the Statistics Poland Knowledge Databases (DBW). Typical flow: search_areas -> find_variables -> " +
   "get_variable_metadata / list_sections_and_periods -> get_section_dimensions -> estimate_data_size -> " +
-  "preview_data -> get_data_page or get_complete_data. All ids are DBW integers. Errors include a code and a hint.";
+  "preview_data -> get_data_page or get_complete_data. For several years or periods use get_data_series (one call, " +
+  "optional levels/position_ids filter, format 'wide' for a ready table) instead of many single-period calls. " +
+  "DBW requests are a shared, limited budget: check quota_status before large downloads; downloaded data is cached. " +
+  "All ids are DBW integers. Errors include a code and a hint.";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",

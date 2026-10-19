@@ -1,0 +1,312 @@
+import { type Args, boolArg, enumArg, intArg, intListArg, langArg, normalizeText, strListArg } from "./args.ts";
+import { getSectionPositions, type SectionPosition, TERRITORIAL_LEVELS, type TerritorialLevel } from "./catalog.ts";
+import { DBW_MAX_PAGE_SIZE } from "./dbw-client.ts";
+import {
+  createRowDecoder,
+  type DecodedRow,
+  dimensionOrder,
+  getDecodingDictionaries,
+  getDictionary,
+  type RawDataRow,
+  rowsToCsv,
+} from "./decode.ts";
+import {
+  type DataRequest,
+  describePeriods,
+  fetchDataPage,
+  MAX_COMPLETE_ROWS,
+  resolveSection,
+  type ToolContext,
+} from "./data.ts";
+import { isToolError, ToolError } from "./errors.ts";
+
+export const MAX_SERIES_COMBINATIONS = 120;
+export const MAX_SERIES_YEARS = 30;
+const MAX_PAGES_PER_COMBINATION = MAX_COMPLETE_ROWS / DBW_MAX_PAGE_SIZE;
+const CONCURRENCY = 3;
+const TIME_BUDGET_MS = 90_000;
+
+const LEVEL_ALIASES: Record<string, TerritorialLevel> = {
+  polska: "poland",
+  makroregion: "macroregion",
+  wojewodztwo: "voivodeship",
+  wojewodztwa: "voivodeship",
+  podregion: "subregion",
+  powiat: "county",
+  powiaty: "county",
+  gmina: "municipality",
+  gminy: "municipality",
+};
+
+function parseLevels(args: Args): Set<TerritorialLevel> | undefined {
+  const raw = strListArg(args, "levels", TERRITORIAL_LEVELS.length);
+  if (!raw) return undefined;
+  const out = new Set<TerritorialLevel>();
+  for (const value of raw) {
+    const key = normalizeText(value);
+    const level = (TERRITORIAL_LEVELS as readonly string[]).includes(key) ? key as TerritorialLevel : LEVEL_ALIASES[key];
+    if (!level) {
+      throw new ToolError("INVALID_ARGUMENT", `Unknown level "${value}".`, {
+        hint: `Use one of: ${TERRITORIAL_LEVELS.join(", ")}.`,
+      });
+    }
+    out.add(level);
+  }
+  return out;
+}
+
+type Combination = { year: number; periodId: number; period: string; periodName: string };
+type Outcome =
+  | { status: "ok"; rows: RawDataRow[] }
+  | { status: "empty"; reason: string }
+  | { status: "pending"; reason: string };
+
+function rowPositions(raw: RawDataRow): [number, number][] {
+  const out: [number, number][] = [];
+  for (let n = 1; raw[`id-wymiar-${n}`] !== undefined; n++) {
+    out.push([Number(raw[`id-wymiar-${n}`]), Number(raw[`id-pozycja-${n}`])]);
+  }
+  return out;
+}
+
+// Only dimensions touched by a filter are restricted; others pass through unchanged.
+function buildPositionFilter(positions: SectionPosition[], positionIds?: number[], levels?: Set<TerritorialLevel>) {
+  if (!positionIds && !levels) return undefined;
+  const known = new Set(positions.map((p) => p.positionId));
+  const unknown = positionIds?.filter((id) => !known.has(id)) ?? [];
+  if (unknown.length) {
+    throw new ToolError("INVALID_ARGUMENT", `Position ids not in this section: ${unknown.join(", ")}.`, {
+      hint: "Use get_section_dimensions to list valid position ids.",
+    });
+  }
+  const idDims = new Set(positions.filter((p) => positionIds?.includes(p.positionId)).map((p) => p.dimensionId));
+  const levelDims = new Set(positions.filter((p) => p.level !== null).map((p) => p.dimensionId));
+  if (levels && levelDims.size === 0) {
+    throw new ToolError("INVALID_ARGUMENT", "This section has no territorial dimension, so levels cannot be used.", {
+      hint: "Filter with position_ids instead.",
+    });
+  }
+  const allowed = new Map<number, Set<number>>();
+  for (const p of positions) {
+    const restrictedById = idDims.has(p.dimensionId);
+    const restrictedByLevel = levels !== undefined && levelDims.has(p.dimensionId);
+    if (!restrictedById && !restrictedByLevel) continue;
+    const set = allowed.get(p.dimensionId) ?? new Set<number>();
+    allowed.set(p.dimensionId, set);
+    if (restrictedById && !positionIds!.includes(p.positionId)) continue;
+    if (restrictedByLevel && !(p.level && levels!.has(p.level))) continue;
+    set.add(p.positionId);
+  }
+  if ([...allowed.values()].some((s) => s.size === 0)) {
+    const present = [...new Set(positions.map((p) => p.level).filter(Boolean))].join(", ");
+    throw new ToolError("NO_DATA", "No positions in this section match the requested filter.", {
+      hint: `Levels present in this section: ${present || "none"}.`,
+    });
+  }
+  return (raw: RawDataRow) => rowPositions(raw).every(([dim, pos]) => allowed.get(dim)?.has(pos) ?? true);
+}
+
+async function resolvePeriods(ctx: ToolContext, args: Args, sectionPeriodIds: number[], lang: DataRequest["lang"]) {
+  const ids = intListArg(args, "period_ids", { min: 1, max: 1_000_000, maxItems: 60 });
+  const symbols = strListArg(args, "period_symbols", 60);
+  if (ids && symbols) throw new ToolError("INVALID_ARGUMENT", 'Use either "period_ids" or "period_symbols", not both.');
+  const dict = new Map((await getDictionary(ctx.client, "periods", lang)).map((p) => [p.id, p]));
+  let chosen = sectionPeriodIds;
+  if (ids) chosen = ids;
+  if (symbols) {
+    const bySymbol = new Map(sectionPeriodIds.map((id) => [(dict.get(id)?.symbol ?? "").toUpperCase(), id]));
+    chosen = symbols.map((s) => bySymbol.get(s.toUpperCase()) ?? -1);
+    const bad = symbols.filter((_, i) => chosen[i] === -1);
+    if (bad.length) {
+      throw new ToolError("INVALID_ARGUMENT", `Period symbols not available for this section: ${bad.join(", ")}.`, {
+        hint: `Available periods: ${await describePeriods(ctx, sectionPeriodIds, lang)}.`,
+      });
+    }
+  }
+  const missing = chosen.filter((id) => !sectionPeriodIds.includes(id));
+  if (missing.length) {
+    throw new ToolError("INVALID_ARGUMENT", `Period ids not available for this section: ${missing.join(", ")}.`, {
+      hint: `Available periods: ${await describePeriods(ctx, sectionPeriodIds, lang)}.`,
+    });
+  }
+  return chosen.map((id) => ({ periodId: id, period: dict.get(id)?.symbol ?? "", periodName: dict.get(id)?.name ?? "" }));
+}
+
+async function fetchCombination(ctx: ToolContext, req: DataRequest): Promise<Outcome> {
+  try {
+    const first = await fetchDataPage(ctx, req, 0, DBW_MAX_PAGE_SIZE);
+    if (first.pageCount > MAX_PAGES_PER_COMBINATION) {
+      return { status: "empty", reason: `too large (over ${MAX_COMPLETE_ROWS} rows); use get_data_page` };
+    }
+    const rows = [...first.rows];
+    for (let page = 1; page < first.pageCount; page++) {
+      rows.push(...(await fetchDataPage(ctx, req, page, DBW_MAX_PAGE_SIZE)).rows);
+    }
+    return { status: "ok", rows };
+  } catch (err) {
+    if (isToolError(err, "NO_DATA")) return { status: "empty", reason: "no data published for this year and period" };
+    throw err;
+  }
+}
+
+function toWide(groups: { label: string; rows: DecodedRow[] }[], dimensions: string[]) {
+  const columns = groups.map((g) => g.label);
+  const table = new Map<string, Record<string, string | number | null>>();
+  for (const g of groups) {
+    for (const r of g.rows) {
+      const key = JSON.stringify([...dimensions.map((d) => r.dimensions[d]), r.unit]);
+      let entry = table.get(key);
+      if (!entry) {
+        entry = Object.fromEntries(dimensions.map((d) => [d, r.dimensions[d] ?? null]));
+        entry.unit = r.unit;
+        for (const c of columns) entry[c] = null;
+        table.set(key, entry);
+      }
+      entry[g.label] = r.value;
+    }
+  }
+  return { columns, table: [...table.values()] };
+}
+
+export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Record<string, unknown>> {
+  const variableId = intArg(args, "variable_id", { required: true, min: 1 });
+  const sectionId = intArg(args, "section_id", { required: true, min: 1 });
+  const years = intListArg(args, "years", { min: 1800, max: 2200, maxItems: MAX_SERIES_YEARS });
+  if (!years) throw new ToolError("INVALID_ARGUMENT", '"years" is required, e.g. [2020, 2021, 2022].');
+  const positionIds = intListArg(args, "position_ids", { min: 1, max: 1_000_000_000, maxItems: 1000 });
+  const levels = parseLevels(args);
+  const format = enumArg(args, "format", ["json", "csv", "wide"] as const, "json");
+  const includeCodes = boolArg(args, "include_codes", false);
+  const lang = langArg(args);
+
+  const { variable, section, range } = await resolveSection(ctx, variableId, sectionId, lang);
+  const periods = await resolvePeriods(ctx, args, section.periodIds, lang);
+  const combos: Combination[] = [...years].sort((a, b) => a - b)
+    .flatMap((year) => periods.map((p) => ({ year, ...p })));
+  if (combos.length > MAX_SERIES_COMBINATIONS) {
+    throw new ToolError("TOO_LARGE", `${combos.length} year/period combinations requested; the limit is ${MAX_SERIES_COMBINATIONS}.`, {
+      hint: "Split the request into fewer years or periods.",
+    });
+  }
+
+  const positions = await getSectionPositions(ctx.client, sectionId, lang);
+  const keep = buildPositionFilter(positions, positionIds, levels);
+  const dicts = await getDecodingDictionaries(ctx.client, lang);
+  const decode = createRowDecoder(dicts, positions, includeCodes);
+  const dimensions = dimensionOrder(positions);
+
+  const outcomes: Outcome[] = new Array(combos.length);
+  let retryAfter: number | undefined;
+  let rateError: ToolError | undefined;
+  let keptRows = 0;
+  const started = Date.now();
+  let next = 0;
+
+  async function worker() {
+    while (next < combos.length) {
+      const i = next++;
+      const c = combos[i];
+      if (range && (c.year < range.from || c.year > range.to)) {
+        outcomes[i] = { status: "empty", reason: `outside the published time series (${range.from}-${range.to})` };
+        continue;
+      }
+      if (rateError) {
+        outcomes[i] = { status: "pending", reason: "request budget used up" };
+        continue;
+      }
+      if (Date.now() - started > TIME_BUDGET_MS) {
+        outcomes[i] = { status: "pending", reason: "time limit for one call reached" };
+        continue;
+      }
+      if (keptRows > MAX_COMPLETE_ROWS) {
+        outcomes[i] = { status: "pending", reason: `row limit of ${MAX_COMPLETE_ROWS} reached` };
+        continue;
+      }
+      const req: DataRequest = {
+        variableId,
+        variableName: variable.name,
+        sectionId,
+        sectionName: section.name,
+        year: c.year,
+        periodId: c.periodId,
+        lang,
+      };
+      try {
+        const out = await fetchCombination(ctx, req);
+        if (out.status === "ok" && keep) out.rows = out.rows.filter(keep);
+        if (out.status === "ok") keptRows += out.rows.length;
+        outcomes[i] = out;
+      } catch (err) {
+        if (isToolError(err, "RATE_LIMITED")) {
+          rateError = err;
+          retryAfter = Math.max(retryAfter ?? 0, err.retryAfterSeconds ?? 60);
+          outcomes[i] = { status: "pending", reason: "request budget used up" };
+        } else if (isToolError(err)) {
+          outcomes[i] = { status: "pending", reason: err.message };
+        } else {
+          throw err;
+        }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  const describe = (c: Combination) => ({ year: c.year, period_id: c.periodId, period: c.period || c.periodName });
+  const label = (c: Combination) => (periods.length === 1 || !c.period ? String(c.year) : `${c.year} ${c.period}`);
+  const executed: Record<string, unknown>[] = [];
+  const empty: Record<string, unknown>[] = [];
+  const pending: Record<string, unknown>[] = [];
+  const groups: { label: string; rows: DecodedRow[] }[] = [];
+  combos.forEach((c, i) => {
+    const o = outcomes[i];
+    if (o.status === "ok") {
+      executed.push({ ...describe(c), rows: o.rows.length });
+      groups.push({ label: label(c), rows: o.rows.map(decode) });
+    } else if (o.status === "empty") empty.push({ ...describe(c), reason: o.reason });
+    else pending.push({ ...describe(c), reason: o.reason });
+  });
+
+  if (rateError && executed.length === 0 && empty.length === 0) throw rateError;
+  if (keptRows > MAX_COMPLETE_ROWS) {
+    throw new ToolError("TOO_LARGE", `The selection has more than ${MAX_COMPLETE_ROWS} rows after filtering.`, {
+      hint: "Narrow it with levels, position_ids, fewer years or fewer periods.",
+    });
+  }
+
+  const decoded = groups.flatMap((g) => g.rows);
+
+  return {
+    variable_id: variableId,
+    variable_name: variable.name,
+    section_id: sectionId,
+    section_name: section.name,
+    lang,
+    selection: {
+      years: [...years].sort((a, b) => a - b),
+      periods: periods.map((p) => ({ period_id: p.periodId, period: p.period || p.periodName })),
+      position_ids: positionIds ?? null,
+      levels: levels ? [...levels] : null,
+    },
+    complete: pending.length === 0,
+    executed,
+    empty,
+    pending,
+    ...(pending.length
+      ? {
+        ...(retryAfter !== undefined ? { retry_after_seconds: retryAfter } : {}),
+        next_step:
+          "Call get_data_series again with the same arguments" +
+          (retryAfter !== undefined ? ` after ${retryAfter}s` : "") +
+          ". Combinations already downloaded come from the cache and cost no DBW requests.",
+      }
+      : {}),
+    returned_rows: decoded.length,
+    format,
+    dimensions,
+    ...(format === "csv"
+      ? { csv: rowsToCsv(decoded, dimensions) }
+      : format === "wide"
+      ? toWide(groups, dimensions)
+      : { rows: decoded }),
+  };
+}

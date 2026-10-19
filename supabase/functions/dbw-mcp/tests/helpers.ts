@@ -1,6 +1,6 @@
 import { createDbwClient } from "../dbw-client.ts";
 import { createMcpHandler } from "../server.ts";
-import type { Cache, RateDecision, RateLimiter, RateRule } from "../store.ts";
+import type { Cache, RateDecision, RateLimiter, RateRule, RateUsage } from "../store.ts";
 import { tools } from "../tools.ts";
 
 export function memoryCache(): Cache & { store: Map<string, unknown> } {
@@ -30,10 +30,17 @@ export function memoryLimiter(): RateLimiter & { calls: RateRule[][] } {
       for (const r of rules) counts.set(r.bucket, (counts.get(r.bucket) ?? 0) + 1);
       return Promise.resolve({ allowed: true });
     },
+    peek(rules: RateRule[]): Promise<RateUsage[]> {
+      return Promise.resolve(rules.map((r) => ({ bucket: r.bucket, hits: counts.get(r.bucket) ?? 0, resetAfterSeconds: r.windowSeconds })));
+    },
   };
 }
 
-export const allowAll: RateLimiter = { consume: () => Promise.resolve({ allowed: true }) };
+export const allowAll: RateLimiter = {
+  consume: () => Promise.resolve({ allowed: true }),
+  peek: (rules) => Promise.resolve(rules.map((r) => ({ bucket: r.bucket, hits: 0, resetAfterSeconds: r.windowSeconds }))),
+};
+
 
 const areas = [
   { id: 1, nazwa: "Prices", "id-nadrzedny-element": 727, "id-poziom": 1, "nazwa-poziom": "Domain", "czy-zmienne": false },
@@ -75,6 +82,43 @@ const positions = [
   { "id-przekroj": 1163, "id-wymiar": 15, "nazwa-wymiar": "Age", "id-pozycja": 40, "nazwa-pozycja": "15-24", symbol: "a" },
   { "id-przekroj": 1163, "id-wymiar": 15, "nazwa-wymiar": "Age", "id-pozycja": 41, "nazwa-pozycja": "25 and over, \"total\"", symbol: "b" },
 ];
+
+const regionalPositions = [
+  { "id-przekroj": 1164, "id-wymiar": 3, "nazwa-wymiar": "Territory", "id-pozycja": 30, "nazwa-pozycja": "POLAND", symbol: "10000000000000" },
+  { "id-przekroj": 1164, "id-wymiar": 3, "nazwa-wymiar": "Territory", "id-pozycja": 31, "nazwa-pozycja": "MAŁOPOLSKIE", symbol: "10011200000000" },
+  { "id-przekroj": 1164, "id-wymiar": 3, "nazwa-wymiar": "Territory", "id-pozycja": 32, "nazwa-pozycja": "ŚLĄSKIE", symbol: "10012400000000" },
+  { "id-przekroj": 1164, "id-wymiar": 3, "nazwa-wymiar": "Territory", "id-pozycja": 33, "nazwa-pozycja": "Powiat krakowski", symbol: "10011213061000" },
+  { "id-przekroj": 1164, "id-wymiar": 4, "nazwa-wymiar": "Education", "id-pozycja": 50, "nazwa-pozycja": "Total", symbol: "0" },
+  { "id-przekroj": 1164, "id-wymiar": 4, "nazwa-wymiar": "Education", "id-pozycja": 51, "nazwa-pozycja": "Higher", symbol: "1" },
+];
+
+export const REGIONAL_YEARS = [2019, 2020];
+
+function regionalRows(year: number) {
+  const rows = [];
+  for (const territory of [30, 31, 32, 33]) {
+    for (const edu of [50, 51]) {
+      rows.push({
+        rownumber: rows.length + 1,
+        "id-zmienna": 1,
+        "id-przekroj": 1164,
+        "id-wymiar-1": 3,
+        "id-pozycja-1": territory,
+        "id-wymiar-2": 4,
+        "id-pozycja-2": edu,
+        "id-okres": 282,
+        "id-sposob-prezentacji-miara": 98,
+        "id-daty": year,
+        "id-brak-wartosci": 253,
+        "id-tajnosci": 43,
+        "id-flaga": 36,
+        wartosc: territory * 10 + (edu - 50) + (year - 2019) * 1000,
+        precyzja: 0,
+      });
+    }
+  }
+  return rows;
+}
 
 const dictionaries: Record<string, unknown[]> = {
   "periods-dictionary": [
@@ -158,8 +202,12 @@ export function fakeDbw(options: FakeDbwOptions = {}) {
     } else if (path === "/variable/variable-section-periods") {
       body = page(sectionPeriods, n("numer-strony"), n("ile-na-stronie"));
     } else if (path === "/variable/variable-meta") body = n("id-zmiennej") === 1 ? meta : null;
-    else if (path === "/variable/variable-section-position") body = n("id-przekroj") === 1163 ? positions : null;
-    else if (path === "/variable/variable-data-section") {
+    else if (path === "/variable/variable-section-position") {
+      body = n("id-przekroj") === 1163 ? positions : n("id-przekroj") === 1164 ? regionalPositions : null;
+    } else if (path === "/variable/variable-data-section" && n("id-przekroj") === 1164) {
+      const match = n("id-zmienna") === 1 && REGIONAL_YEARS.includes(n("id-rok")) && n("id-okres") === 282;
+      body = match ? page(regionalRows(n("id-rok")), n("numer-strony"), n("ile-na-stronie")) : null;
+    } else if (path === "/variable/variable-data-section") {
       const match = n("id-zmienna") === 1 && n("id-przekroj") === 1163 && n("id-rok") === 2019 && n("id-okres") === 270;
       const size = n("ile-na-stronie");
       body = match && size <= 5000
@@ -175,12 +223,14 @@ export function fakeDbw(options: FakeDbwOptions = {}) {
   return { fetchImpl, calls };
 }
 
-export function setup(options: FakeDbwOptions & { apiKey?: string; accessToken?: string; limiter?: RateLimiter } = {}) {
+export function setup(
+  options: FakeDbwOptions & { apiKey?: string; accessToken?: string; limiter?: RateLimiter; dbwLimiter?: RateLimiter } = {},
+) {
   const dbw = fakeDbw(options);
   const cache = memoryCache();
   const client = createDbwClient({
     apiKey: options.apiKey,
-    limiter: allowAll,
+    limiter: options.dbwLimiter ?? allowAll,
     cache,
     fetchImpl: dbw.fetchImpl,
     sleep: () => Promise.resolve(),

@@ -23,6 +23,7 @@ test("anonymous mode sends no key and uses stricter budgets", async () => {
       this.buckets.push(...rules.map((r) => `${r.bucket}=${r.limit}`));
       return Promise.resolve({ allowed: true });
     },
+    peek: allowAll.peek,
   };
   const dbw = fakeDbw();
   const client = createDbwClient({ limiter, cache: memoryCache(), fetchImpl: dbw.fetchImpl });
@@ -42,7 +43,7 @@ test("per-second budget waits briefly; longer budgets fail with RATE_LIMITED", a
   const dbw = fakeDbw();
   const waiting = createDbwClient({
     apiKey: "k",
-    limiter: { consume: () => Promise.resolve(decisions.shift()!) },
+    limiter: { consume: () => Promise.resolve(decisions.shift()!), peek: allowAll.peek },
     cache: memoryCache(),
     fetchImpl: dbw.fetchImpl,
     sleep: (ms) => {
@@ -55,7 +56,10 @@ test("per-second budget waits briefly; longer budgets fail with RATE_LIMITED", a
 
   const blocked = createDbwClient({
     apiKey: "k",
-    limiter: { consume: () => Promise.resolve({ allowed: false, bucket: "dbw:15m", retryAfterSeconds: 300 }) },
+    limiter: {
+      consume: () => Promise.resolve({ allowed: false, bucket: "dbw:15m", retryAfterSeconds: 300 }),
+      peek: allowAll.peek,
+    },
     cache: memoryCache(),
     fetchImpl: dbw.fetchImpl,
   });

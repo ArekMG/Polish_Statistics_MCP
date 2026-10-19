@@ -167,7 +167,20 @@ test("get_complete_data fetches every page and outputs escaped CSV", async () =>
   assert.equal(lines[1], "2019,Q1,Males,POLAND,15-24,,1,[thousand persons],(.) data not available,,s Estimated value");
   assert.equal(lines[4], '2019,Q1,Males,POLAND,"25 and over, ""total""",1003,1,[thousand persons],,,');
   const dataCalls = dbw.calls.filter((c) => c.url.pathname.endsWith("variable-data-section"));
-  assert.deepEqual(dataCalls.map((c) => c.url.searchParams.get("numer-strony")), ["0", "0", "1", "2"]);
+  assert.deepEqual(dataCalls.map((c) => c.url.searchParams.get("numer-strony")), ["0", "1", "2"]);
+  assert.ok(out.upstream_requests >= 3);
+
+  const again = await call("get_complete_data", DATA_ARGS);
+  assert.equal(again.structuredContent.upstream_requests, 0);
+});
+
+test("preview_data needs a single data request and reports usage", async () => {
+  const { call, dbw } = setup();
+  const res = await call("preview_data", DATA_ARGS);
+  assert.equal(res.structuredContent.total_rows, 18);
+  const dataCalls = dbw.calls.filter((c) => c.url.pathname.endsWith("variable-data-section"));
+  assert.equal(dataCalls.length, 1);
+  assert.ok("quota" in res.structuredContent);
 });
 
 test("get_complete_data refuses oversized selections", async () => {

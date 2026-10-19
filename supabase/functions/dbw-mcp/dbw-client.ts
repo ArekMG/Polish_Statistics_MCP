@@ -27,10 +27,33 @@ export type DbwGetOptions = {
   cacheTtlSeconds?: number;
 };
 
+export type QuotaBucket = {
+  limit_id: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  window_seconds: number;
+  reset_after_seconds: number;
+};
+
 export type DbwClient = {
   registered: boolean;
   get<T>(path: string, params: Record<string, string | number>, lang: Lang, options?: DbwGetOptions): Promise<T>;
+  tracked(): TrackedDbwClient;
+  quota(): Promise<QuotaBucket[] | undefined>;
 };
+
+export type TrackedDbwClient = DbwClient & { upstreamRequests(): number };
+
+export const CACHED_TOOLS = [
+  "search_areas",
+  "find_variables",
+  "get_variable_metadata",
+  "list_sections_and_periods",
+  "get_section_dimensions",
+  "get_dictionary",
+  "quota_status",
+];
 
 // Kept below the published DBW limits (anonymous 5/s, 100/15min, 1000/12h, 10000/7d;
 // registered 10/s, 500/15min, 5000/12h, 50000/7d) so this server never trips them.
@@ -77,12 +100,18 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
       const decision = await options.limiter.consume(rules);
       if (decision.allowed) return;
       if (decision.retryAfterSeconds > MAX_SHORT_WAIT_SECONDS) {
+        const rule = rules.find((r) => r.bucket === decision.bucket);
         throw new ToolError(
           "RATE_LIMITED",
           `The shared DBW request budget for this server is used up (limit "${decision.bucket}").`,
           {
             retryAfterSeconds: decision.retryAfterSeconds,
-            hint: "Wait before retrying. Cached discovery and metadata calls still work.",
+            hint: "Wait before retrying. Cached discovery and metadata calls, and data already downloaded, still work.",
+            details: {
+              limit_id: decision.bucket,
+              ...(rule ? { limit: rule.limit, window_seconds: rule.windowSeconds } : {}),
+              cached_tools_available: CACHED_TOOLS,
+            },
           },
         );
       }
@@ -94,18 +123,20 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
     });
   }
 
-  async function fetchOnce(url: string): Promise<Response> {
+  async function fetchOnce(url: string, onUpstream: () => void): Promise<Response> {
     await acquireBudget();
+    onUpstream();
     const headers: Record<string, string> = { Accept: "application/json" };
     if (options.apiKey) headers["X-ClientId"] = options.apiKey;
     return await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
   }
 
-  async function get<T>(
+  async function request<T>(
     path: string,
     params: Record<string, string | number>,
     lang: Lang,
-    getOptions: DbwGetOptions = {},
+    getOptions: DbwGetOptions,
+    onUpstream: () => void,
   ): Promise<T> {
     const query = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) query.set(k, String(v));
@@ -123,7 +154,7 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
       if (attempt > 0) await sleep(500);
       let res: Response;
       try {
-        res = await fetchOnce(`${baseUrl}${relative}`);
+        res = await fetchOnce(`${baseUrl}${relative}`, onUpstream);
       } catch (err) {
         if (err instanceof ToolError) throw err;
         const timedOut = err instanceof DOMException && (err.name === "TimeoutError" || err.name === "AbortError");
@@ -173,5 +204,37 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
     throw lastError!;
   }
 
-  return { registered, get };
+  async function quota(): Promise<QuotaBucket[] | undefined> {
+    const usage = await options.limiter.peek(rules);
+    if (!usage) return undefined;
+    return rules.map((r) => {
+      const u = usage.find((x) => x.bucket === r.bucket);
+      const used = Math.min(u?.hits ?? 0, r.limit);
+      return {
+        limit_id: r.bucket,
+        limit: r.limit,
+        used,
+        remaining: r.limit - used,
+        window_seconds: r.windowSeconds,
+        reset_after_seconds: u?.resetAfterSeconds ?? r.windowSeconds,
+      };
+    });
+  }
+
+  function build(onUpstream: () => void): DbwClient {
+    return {
+      registered,
+      get: <T>(path: string, params: Record<string, string | number>, lang: Lang, getOptions: DbwGetOptions = {}) =>
+        request<T>(path, params, lang, getOptions, onUpstream),
+      tracked,
+      quota,
+    };
+  }
+
+  function tracked(): TrackedDbwClient {
+    let count = 0;
+    return { ...build(() => count++), upstreamRequests: () => count };
+  }
+
+  return build(() => {});
 }

@@ -23,9 +23,36 @@ export type SectionPosition = {
   positionId: number;
   positionName: string;
   symbol: string;
+  level: TerritorialLevel | null;
   validFrom: string | null;
   validTo: string | null;
 };
+
+export const TERRITORIAL_LEVELS = [
+  "poland",
+  "macroregion",
+  "voivodeship",
+  "region",
+  "subregion",
+  "county",
+  "municipality",
+] as const;
+export type TerritorialLevel = typeof TERRITORIAL_LEVELS[number];
+
+// Territorial symbols are "10" + a 12-digit unit code: MM macroregion, WW voivodeship, R region, S subregion,
+// PPP county, GGG municipality. The level is the deepest non-zero group.
+export function territorialLevel(symbol: string): TerritorialLevel | null {
+  const m = /^10(\d{2})(\d{2})(\d)(\d)(\d{3})(\d{3})$/.exec(symbol);
+  if (!m) return null;
+  const [, macro, voiv, region, sub, county, gmina] = m;
+  if (gmina !== "000") return "municipality";
+  if (county !== "000") return "county";
+  if (sub !== "0") return "subregion";
+  if (region !== "0") return "region";
+  if (voiv !== "00") return "voivodeship";
+  if (macro !== "00") return "macroregion";
+  return "poland";
+}
 
 type RawArea = {
   id: number;
@@ -175,6 +202,7 @@ export async function getSectionPositions(client: DbwClient, sectionId: number, 
     positionId: p["id-pozycja"],
     positionName: p["nazwa-pozycja"],
     symbol: p.symbol,
+    level: territorialLevel(String(p.symbol ?? "")),
     validFrom: p["data-poczatku"] ?? null,
     validTo: p["data-konca"] ?? null,
   }));
