@@ -7,6 +7,7 @@ export type ErrorCode =
   | "RATE_LIMITED"
   | "UPSTREAM_ERROR"
   | "UPSTREAM_TIMEOUT"
+  | "INVALID_DBW_KEY"
   | "INTERNAL_ERROR";
 
 export type ToolErrorOptions = {

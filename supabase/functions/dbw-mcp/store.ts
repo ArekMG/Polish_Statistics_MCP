@@ -20,6 +20,11 @@ export interface RateLimiter {
 
 type FetchFn = typeof fetch;
 
+export async function sha256Hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // Shared state lives in Postgres (via PostgREST) because server-function instances do not share memory.
 // Failures are logged and treated as cache misses / allowed requests so a database hiccup never takes the server down;
 // DBW still enforces its own limits, which the client maps to RATE_LIMITED errors.

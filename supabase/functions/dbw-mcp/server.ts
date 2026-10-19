@@ -1,5 +1,5 @@
 import { isToolError, ToolError } from "./errors.ts";
-import type { RateLimiter, RateRule } from "./store.ts";
+import { type RateLimiter, type RateRule, sha256Hex } from "./store.ts";
 import type { ToolContext, ToolDefinition } from "./tools.ts";
 
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -13,14 +13,15 @@ const INSTRUCTIONS =
   "optional levels/position_ids filter, format 'wide' for a ready table) instead of many single-period calls. " +
   "DBW requests are a shared, limited budget: check quota_status before large downloads, and use get_data_series with " +
   "dry_run: true to see coverage and cost first; downloaded data is cached. A default language can be set once in the " +
-  "server address (?lang=pl or ?lang=en); a lang argument in a call overrides it. " +
+  "server address (?lang=pl or ?lang=en); a lang argument in a call overrides it. Users with their own DBW API key " +
+  "can send it as the X-DBW-Key header (or ?dbw_key= in the address) to get a separate, larger budget. " +
   "All ids are DBW integers. Errors include a code and a hint.";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, X-Client-Info, Apikey, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID",
+    "Content-Type, Authorization, X-Client-Info, Apikey, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID, X-DBW-Key",
   "Access-Control-Expose-Headers": "Mcp-Session-Id, Retry-After",
 };
 
@@ -30,7 +31,10 @@ export type ServerDeps = {
   limiter: RateLimiter;
   accessToken?: string;
   clientRules?: (clientId: string) => RateRule[];
+  contextForDbwKey?: (dbwKey: string) => Promise<ToolContext>;
 };
+
+const DBW_KEY_PATTERN = /^[A-Za-z0-9._~+\/=-]{8,200}$/;
 
 type JsonRpcId = string | number | null;
 type JsonRpcMessage = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: unknown };
@@ -57,11 +61,6 @@ function timingSafeEqual(a: string, b: string): boolean {
   let diff = ea.length ^ eb.length;
   for (let i = 0; i < Math.max(ea.length, eb.length); i++) diff |= (ea[i] ?? 0) ^ (eb[i] ?? 0);
   return diff === 0;
-}
-
-async function sha256Hex(s: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function clientIp(req: Request): string {
@@ -99,7 +98,12 @@ function toolListing(tools: ToolDefinition[]) {
 
 type DefaultLang = "en" | "pl" | undefined;
 
-async function callTool(deps: ServerDeps, params: Record<string, unknown>, defaultLang: DefaultLang) {
+async function callTool(
+  deps: ServerDeps,
+  context: ToolContext,
+  params: Record<string, unknown>,
+  defaultLang: DefaultLang,
+) {
   const tool = deps.tools.find((t) => t.name === params.name);
   if (!tool) return { error: { code: -32602, message: `Unknown tool: ${String(params.name)}` } };
   const args = params.arguments ?? {};
@@ -109,7 +113,7 @@ async function callTool(deps: ServerDeps, params: Record<string, unknown>, defau
   const record = args as Record<string, unknown>;
   const finalArgs = defaultLang && record.lang === undefined ? { ...record, lang: defaultLang } : record;
   try {
-    return { result: toolResult(await tool.handler(finalArgs, deps.context)) };
+    return { result: toolResult(await tool.handler(finalArgs, context)) };
   } catch (err) {
     if (isToolError(err)) return { result: toolErrorResult(err) };
     console.error(`tool ${tool.name} failed`, err);
@@ -121,7 +125,12 @@ async function callTool(deps: ServerDeps, params: Record<string, unknown>, defau
   }
 }
 
-async function handleMessage(deps: ServerDeps, msg: JsonRpcMessage, defaultLang: DefaultLang): Promise<unknown | undefined> {
+async function handleMessage(
+  deps: ServerDeps,
+  context: ToolContext,
+  msg: JsonRpcMessage,
+  defaultLang: DefaultLang,
+): Promise<unknown | undefined> {
   const isRequest = msg.id !== undefined && msg.id !== null;
   const id = (isRequest ? msg.id : null) as JsonRpcId;
   if (msg.jsonrpc !== "2.0" || (typeof msg.method !== "string" && msg.result === undefined && msg.error === undefined)) {
@@ -151,7 +160,7 @@ async function handleMessage(deps: ServerDeps, msg: JsonRpcMessage, defaultLang:
     case "tools/list":
       return { jsonrpc: "2.0", id, result: { tools: toolListing(deps.tools) } };
     case "tools/call": {
-      const out = await callTool(deps, params, defaultLang);
+      const out = await callTool(deps, context, params, defaultLang);
       return "error" in out ? { jsonrpc: "2.0", id, error: out.error } : { jsonrpc: "2.0", id, result: out.result };
     }
     case "resources/list":
@@ -206,11 +215,18 @@ export function createMcpHandler(deps: ServerDeps) {
       );
     }
 
-    const langParam = new URL(req.url).searchParams.get("lang");
+    const address = new URL(req.url).searchParams;
+    const langParam = address.get("lang");
     if (langParam !== null && langParam !== "en" && langParam !== "pl") {
       return json(rpcError(null, -32600, 'The "lang" setting in the server address must be "en" or "pl".'), 400);
     }
     const defaultLang: DefaultLang = langParam ?? undefined;
+
+    const dbwKey = req.headers.get("x-dbw-key")?.trim() || address.get("dbw_key")?.trim() || "";
+    if (dbwKey && (!DBW_KEY_PATTERN.test(dbwKey) || !deps.contextForDbwKey)) {
+      return json(rpcError(null, -32600, "The DBW key sent with this connection has an invalid format."), 400);
+    }
+    const context = dbwKey ? await deps.contextForDbwKey!(dbwKey) : deps.context;
 
     const raw = await req.text();
     if (new TextEncoder().encode(raw).length > MAX_BODY_BYTES) {
@@ -233,7 +249,7 @@ export function createMcpHandler(deps: ServerDeps) {
         responses.push(rpcError(null, -32600, "Invalid JSON-RPC 2.0 message."));
         continue;
       }
-      const out = await handleMessage(deps, m as JsonRpcMessage, defaultLang);
+      const out = await handleMessage(deps, context, m as JsonRpcMessage, defaultLang);
       if (out !== undefined) responses.push(out);
     }
 

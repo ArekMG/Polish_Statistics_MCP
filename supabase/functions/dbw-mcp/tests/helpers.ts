@@ -249,6 +249,18 @@ export function setup(
     context: { client, cache },
     limiter: options.limiter ?? allowAll,
     accessToken: options.accessToken,
+    contextForDbwKey: (dbwKey) =>
+      Promise.resolve({
+        client: createDbwClient({
+          apiKey: dbwKey,
+          userKey: { budgetId: `dbwkey-test` },
+          limiter: options.dbwLimiter ?? allowAll,
+          cache,
+          fetchImpl: dbw.fetchImpl,
+          sleep: () => Promise.resolve(),
+        }),
+        cache,
+      }),
   });
   let nextId = 1;
 

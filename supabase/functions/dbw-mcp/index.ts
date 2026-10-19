@@ -1,6 +1,6 @@
 import { createDbwClient } from "./dbw-client.ts";
 import { corsHeaders, createMcpHandler } from "./server.ts";
-import { createSupabaseStore } from "./store.ts";
+import { createSupabaseStore, sha256Hex } from "./store.ts";
 import { tools } from "./tools.ts";
 
 const store = createSupabaseStore(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "");
@@ -16,6 +16,16 @@ const handler = createMcpHandler({
   context: { client, cache: store.cache },
   limiter: store.limiter,
   accessToken: Deno.env.get("MCP_ACCESS_TOKEN") || undefined,
+  // The key itself is never stored; budgets are tracked under a hash of it.
+  contextForDbwKey: async (dbwKey) => ({
+    client: createDbwClient({
+      apiKey: dbwKey,
+      userKey: { budgetId: `dbwkey-${(await sha256Hex(dbwKey)).slice(0, 24)}` },
+      limiter: store.limiter,
+      cache: store.cache,
+    }),
+    cache: store.cache,
+  }),
 });
 
 Deno.serve(async (req: Request) => {

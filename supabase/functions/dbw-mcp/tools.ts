@@ -36,6 +36,7 @@ import {
 } from "./data.ts";
 import { ToolError } from "./errors.ts";
 import { AGGREGATE_FNS } from "./aggregate.ts";
+import { ROUND_MODES } from "./rounding.ts";
 import { getDataSeries, MAX_SERIES_COMBINATIONS, MAX_SERIES_YEARS } from "./series.ts";
 
 export type { ToolContext } from "./data.ts";
@@ -553,6 +554,20 @@ export const tools: ToolDefinition[] = [
         type: "boolean",
         default: true,
         description: "List every downloaded combination. Set false to return only executed_count.",
+      },
+      round: {
+        type: "string",
+        enum: [...ROUND_MODES],
+        default: "half_up",
+        description: "Tie rule for rounding, computed in exact decimal arithmetic (5.425 -> 5.43 half_up, 5.42 half_even). " +
+          "'none' returns unrounded floating-point results.",
+      },
+      decimals: {
+        type: "integer",
+        minimum: 0,
+        maximum: 10,
+        description: "Round every returned value to this many decimal places. Default: means get precision + 2 " +
+          "decimals (2-6), other values are returned as published.",
       },
       aggregate: {
         type: "object",

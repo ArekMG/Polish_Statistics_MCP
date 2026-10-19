@@ -1,6 +1,7 @@
 import { type Args, boolArg } from "./args.ts";
 import type { DecodedRow } from "./decode.ts";
 import { ToolError } from "./errors.ts";
+import { rescale, roundFraction, type Rounding, toDecimal } from "./rounding.ts";
 
 export const AGGREGATE_FNS = ["mean", "sum", "min", "max", "first", "last"] as const;
 type AggregateFn = typeof AGGREGATE_FNS[number];
@@ -38,7 +39,7 @@ export function parseAggregate(args: Args): Aggregation | undefined {
   return { fn: fn as AggregateFn, window: "year", allowPartial: boolArg(obj, "allow_partial", false) };
 }
 
-function apply(fn: AggregateFn, values: number[]): number {
+function applyFloat(fn: AggregateFn, values: number[]): number {
   if (fn === "first") return values[0];
   if (fn === "last") return values[values.length - 1];
   if (fn === "sum") return values.reduce((a, b) => a + b, 0);
@@ -47,10 +48,26 @@ function apply(fn: AggregateFn, values: number[]): number {
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
-function roundTo(fn: AggregateFn, value: number, precision: number | null): number {
-  if (fn !== "mean") return value;
-  const digits = Math.min(Math.max((precision ?? 1) + 2, 2), 6);
-  return Number(value.toFixed(digits));
+export const defaultMeanDecimals = (precision: number | null) => Math.min(Math.max((precision ?? 1) + 2, 2), 6);
+
+// Computed in exact decimal arithmetic so ties like 5.425 round the same way for every reader.
+function compute(fn: AggregateFn, values: number[], precision: number | null, rounding: Rounding): number {
+  if (rounding.mode === "none") return applyFloat(fn, values);
+  const decimals = values.map(toDecimal);
+  const scale = Math.max(...decimals.map((d) => d.scale));
+  const ints = decimals.map((d) => rescale(d, scale));
+  let num: bigint;
+  let den = 1n;
+  if (fn === "first") num = ints[0];
+  else if (fn === "last") num = ints[ints.length - 1];
+  else if (fn === "min") num = ints.reduce((a, b) => (b < a ? b : a));
+  else if (fn === "max") num = ints.reduce((a, b) => (b > a ? b : a));
+  else {
+    num = ints.reduce((a, b) => a + b, 0n);
+    if (fn === "mean") den = BigInt(ints.length);
+  }
+  const places = rounding.decimals ?? (fn === "mean" ? defaultMeanDecimals(precision) : scale);
+  return roundFraction(num, den * 10n ** BigInt(scale), places, rounding.mode);
 }
 
 // Incomplete years return null unless allow_partial, so a mean of 11 months is never mistaken for an annual figure.
@@ -60,6 +77,7 @@ export function aggregateByYear(
   agg: Aggregation,
   periodsExpected: number,
   rank: (row: DecodedRow) => number,
+  rounding: Rounding,
 ) {
   const groups = new Map<string, DecodedRow[]>();
   for (const r of rows) {
@@ -85,7 +103,7 @@ export function aggregateByYear(
       period: "",
       period_name: `${agg.fn} of ${values.length}/${periodsExpected} periods`,
       dimensions: first.dimensions,
-      value: usable ? roundTo(agg.fn, apply(agg.fn, values), first.precision) : null,
+      value: usable ? compute(agg.fn, values, first.precision, rounding) : null,
       precision: first.precision,
       unit: first.unit,
       periods_used: values.length,

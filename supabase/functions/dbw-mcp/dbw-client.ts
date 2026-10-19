@@ -15,6 +15,8 @@ export type DbwPage<T> = {
 
 export type DbwClientOptions = {
   apiKey?: string;
+  // Supplied by the caller (X-DBW-Key) rather than the operator; gets its own budget and error wording.
+  userKey?: { budgetId: string };
   limiter: RateLimiter;
   cache: Cache;
   fetchImpl?: typeof fetch;
@@ -64,19 +66,19 @@ export const CACHED_TOOLS = [
 
 // Kept below the published DBW limits (anonymous 5/s, 100/15min, 1000/12h, 10000/7d;
 // registered 10/s, 500/15min, 5000/12h, 50000/7d) so this server never trips them.
-function upstreamRules(registered: boolean): RateRule[] {
+function upstreamRules(registered: boolean, budgetId = registered ? "dbw" : "dbw-anon"): RateRule[] {
   return registered
     ? [
-      { bucket: "dbw:1s", windowSeconds: 1, limit: 8 },
-      { bucket: "dbw:15m", windowSeconds: 900, limit: 450 },
-      { bucket: "dbw:12h", windowSeconds: 43200, limit: 4500 },
-      { bucket: "dbw:7d", windowSeconds: 604800, limit: 45000 },
+      { bucket: `${budgetId}:1s`, windowSeconds: 1, limit: 8 },
+      { bucket: `${budgetId}:15m`, windowSeconds: 900, limit: 450 },
+      { bucket: `${budgetId}:12h`, windowSeconds: 43200, limit: 4500 },
+      { bucket: `${budgetId}:7d`, windowSeconds: 604800, limit: 45000 },
     ]
     : [
-      { bucket: "dbw-anon:1s", windowSeconds: 1, limit: 4 },
-      { bucket: "dbw-anon:15m", windowSeconds: 900, limit: 90 },
-      { bucket: "dbw-anon:12h", windowSeconds: 43200, limit: 900 },
-      { bucket: "dbw-anon:7d", windowSeconds: 604800, limit: 9000 },
+      { bucket: `${budgetId}:1s`, windowSeconds: 1, limit: 4 },
+      { bucket: `${budgetId}:15m`, windowSeconds: 900, limit: 90 },
+      { bucket: `${budgetId}:12h`, windowSeconds: 43200, limit: 900 },
+      { bucket: `${budgetId}:7d`, windowSeconds: 604800, limit: 9000 },
     ];
 }
 
@@ -100,7 +102,8 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
   const timeoutMs = options.timeoutMs ?? 30000;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const registered = Boolean(options.apiKey);
-  const rules = upstreamRules(registered);
+  const rules = upstreamRules(registered, options.userKey?.budgetId);
+  const budgetName = options.userKey ? "The DBW request budget for your DBW key" : "The shared DBW request budget for this server";
 
   async function acquireBudget() {
     for (let attempt = 0; attempt < MAX_BUDGET_ATTEMPTS; attempt++) {
@@ -110,7 +113,7 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
         const rule = rules.find((r) => r.bucket === decision.bucket);
         throw new ToolError(
           "RATE_LIMITED",
-          `The shared DBW request budget for this server is used up (limit "${decision.bucket}").`,
+          `${budgetName} is used up (limit "${decision.bucket}").`,
           {
             retryAfterSeconds: decision.retryAfterSeconds,
             hint: "Wait before retrying. Cached discovery and metadata calls, and data already downloaded, still work.",
@@ -197,6 +200,11 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
         });
       }
       if (res.status === 401 || res.status === 403) {
+        if (options.userKey) {
+          throw new ToolError("INVALID_DBW_KEY", "DBW rejected the DBW key sent with this connection.", {
+            hint: "Check the key in the connection settings (X-DBW-Key), or remove it to use the shared anonymous budget.",
+          });
+        }
         throw new ToolError("UPSTREAM_ERROR", "DBW refused the server's credentials.", {
           hint: "The server operator should check the configured DBW API key.",
         });

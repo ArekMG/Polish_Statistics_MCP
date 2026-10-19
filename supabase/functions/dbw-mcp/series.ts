@@ -22,6 +22,56 @@ import {
   type ToolContext,
 } from "./data.ts";
 import { isToolError, ToolError } from "./errors.ts";
+import { parseRounding, roundValue } from "./rounding.ts";
+import { sha256Hex } from "./store.ts";
+
+type Group = { label: string; rows: DecodedRow[] };
+type SeriesResult = {
+  core: Record<string, unknown>;
+  executed: Record<string, unknown>[];
+  dimensions: string[];
+  groups: Group[];
+};
+
+const PRESENTATION_ARGS = new Set(["format", "include_executed", "dry_run"]);
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+// Keyed on every argument that changes the numbers, so format and list trimming reuse one cached result.
+async function resultCacheKey(args: Args, lang: string) {
+  const relevant = Object.fromEntries(Object.entries(args).filter(([k]) => !PRESENTATION_ARGS.has(k)));
+  return `series|v1|${await sha256Hex(stableJson({ ...relevant, lang }))}`;
+}
+
+function present(
+  result: SeriesResult,
+  format: "json" | "csv" | "wide",
+  includeExecuted: boolean,
+  fromCache: boolean,
+): Record<string, unknown> {
+  const decoded = result.groups.flatMap((g) => g.rows);
+  return {
+    ...result.core,
+    executed: includeExecuted ? result.executed : undefined,
+    executed_count: result.executed.length,
+    returned_rows: decoded.length,
+    format,
+    dimensions: result.dimensions,
+    ...(fromCache ? { from_result_cache: true } : {}),
+    ...(format === "csv"
+      ? { csv: rowsToCsv(decoded, result.dimensions) }
+      : format === "wide"
+      ? toWide(result.groups, result.dimensions)
+      : { rows: decoded }),
+  };
+}
 
 export const MAX_SERIES_COMBINATIONS = 120;
 export const MAX_SERIES_YEARS = 30;
@@ -212,7 +262,14 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   const dryRun = boolArg(args, "dry_run", false);
   const includeExecuted = boolArg(args, "include_executed", true);
   const aggregate = parseAggregate(args);
+  const rounding = parseRounding(args);
   const lang = langArg(args);
+
+  const resultKey = dryRun ? undefined : await resultCacheKey(args, lang);
+  const hit = resultKey ? await ctx.cache.get<SeriesResult>(resultKey) : undefined;
+  if (hit?.core && Array.isArray(hit.groups) && Array.isArray(hit.executed)) {
+    return present(hit, format, includeExecuted, true);
+  }
 
   const { variable, section, range } = await resolveSection(ctx, variableId, sectionId, lang);
   const periods = await resolvePeriods(ctx, args, section.periodIds, lang);
@@ -371,13 +428,18 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     });
   }
 
-  let decoded: DecodedRow[] = groups.flatMap((g) => g.rows);
-  let outputGroups = groups;
+  let outputGroups: Group[] = groups;
   let aggregation: Record<string, unknown> | undefined;
   if (aggregate) {
     const ranks = new Map(periods.map((p) => [p.period || String(p.periodId), periodRank(p.period, p.periodId)]));
-    const result = aggregateByYear(decoded, dimensions, aggregate, periods.length, (r) => ranks.get(r.period) ?? 0);
-    decoded = result.rows;
+    const result = aggregateByYear(
+      groups.flatMap((g) => g.rows),
+      dimensions,
+      aggregate,
+      periods.length,
+      (r) => ranks.get(r.period) ?? 0,
+      rounding,
+    );
     outputGroups = [...new Set(result.rows.map((r) => r.year))].map((year) => ({
       label: String(year),
       rows: result.rows.filter((r) => r.year === year),
@@ -393,9 +455,13 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
         : "Years missing any period have value null; set allow_partial: true to compute them anyway.",
       ...(annualWarning ? { warning: annualWarning } : {}),
     };
+  } else if (rounding.decimals !== undefined) {
+    for (const g of outputGroups) {
+      for (const r of g.rows) if (r.value !== null) r.value = roundValue(r.value, rounding);
+    }
   }
 
-  return {
+  const core: Record<string, unknown> = {
     variable_id: variableId,
     variable_name: variable.name,
     section_id: sectionId,
@@ -408,8 +474,6 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       levels: levels ? [...levels] : null,
     },
     complete: pending.length === 0,
-    executed: includeExecuted ? executed : undefined,
-    executed_count: executed.length,
     empty,
     pending,
     ...(pending.length
@@ -421,14 +485,15 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
           ". Combinations already downloaded come from the cache and cost no DBW requests.",
       }
       : {}),
-    returned_rows: decoded.length,
-    format,
-    dimensions,
     ...(aggregation ? { aggregation } : {}),
-    ...(format === "csv"
-      ? { csv: rowsToCsv(decoded, dimensions) }
-      : format === "wide"
-      ? toWide(outputGroups, dimensions)
-      : { rows: decoded }),
+    rounding: {
+      mode: rounding.mode,
+      decimals: rounding.decimals ??
+        (rounding.mode === "none" ? "not rounded" : aggregate?.fn === "mean" ? "precision + 2 (2-6)" : "as published"),
+    },
   };
+
+  const result: SeriesResult = { core, executed, dimensions, groups: outputGroups };
+  if (resultKey && pending.length === 0) await ctx.cache.set(resultKey, result, DATA_TTL);
+  return present(result, format, includeExecuted, false);
 }
