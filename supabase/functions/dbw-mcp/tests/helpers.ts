@@ -8,6 +8,7 @@ export function memoryCache(): Cache & { store: Map<string, unknown> } {
   return {
     store,
     get: <T>(key: string) => Promise.resolve(store.get(key) as T | undefined),
+    has: (key: string) => Promise.resolve(store.has(key)),
     set: (key: string, value: unknown) => {
       store.set(key, structuredClone(value));
       return Promise.resolve();

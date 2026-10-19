@@ -6,7 +6,7 @@ import {
   getSectionPositions,
   getVariableMeta,
 } from "./catalog.ts";
-import type { DbwClient, DbwPage, Lang } from "./dbw-client.ts";
+import { type DbwClient, dbwCacheKey, type DbwPage, type Lang } from "./dbw-client.ts";
 import { createRowDecoder, dimensionOrder, getDecodingDictionaries, getDictionary, type RawDataRow } from "./decode.ts";
 import { isToolError, ToolError } from "./errors.ts";
 import type { Cache } from "./store.ts";
@@ -16,7 +16,7 @@ export type ToolContext = { client: DbwClient; cache: Cache };
 export const PREVIEW_ROWS = 1000;
 export const MAX_COMPLETE_ROWS = 20000;
 const COUNT_TTL = 3600;
-const DATA_TTL = 6 * 3600;
+export const DATA_TTL = 6 * 3600;
 
 export type DataRequest = {
   variableId: number;
@@ -124,6 +124,10 @@ function dataParams(req: DataRequest, page: number, pageSize: number) {
     "ile-na-stronie": pageSize,
     "numer-strony": page,
   };
+}
+
+export function dataPageCacheKey(req: DataRequest, page: number, pageSize: number) {
+  return dbwCacheKey("/variable/variable-data-section", dataParams(req, page, pageSize), req.lang);
 }
 
 function noData(req: DataRequest) {

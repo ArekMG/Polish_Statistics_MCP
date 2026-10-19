@@ -27,6 +27,13 @@ export type DbwGetOptions = {
   cacheTtlSeconds?: number;
 };
 
+export function dbwCacheKey(path: string, params: Record<string, string | number>, lang: Lang): string {
+  const query = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) query.set(k, String(v));
+  query.set("lang", lang);
+  return `dbw|${path}?${query.toString()}`;
+}
+
 export type QuotaBucket = {
   limit_id: string;
   limit: number;
@@ -138,11 +145,8 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
     getOptions: DbwGetOptions,
     onUpstream: () => void,
   ): Promise<T> {
-    const query = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) query.set(k, String(v));
-    query.set("lang", lang);
-    const relative = `${path}?${query.toString()}`;
-    const cacheKey = `dbw|${relative}`;
+    const cacheKey = dbwCacheKey(path, params, lang);
+    const relative = cacheKey.slice("dbw|".length);
 
     if (getOptions.cacheTtlSeconds) {
       const hit = await options.cache.get<T>(cacheKey);

@@ -35,6 +35,7 @@ import {
   withUsage,
 } from "./data.ts";
 import { ToolError } from "./errors.ts";
+import { AGGREGATE_FNS } from "./aggregate.ts";
 import { getDataSeries, MAX_SERIES_COMBINATIONS, MAX_SERIES_YEARS } from "./series.ts";
 
 export type { ToolContext } from "./data.ts";
@@ -50,8 +51,8 @@ export type ToolDefinition = {
 const lang = {
   type: "string",
   enum: ["en", "pl"],
-  default: "en",
-  description: "Language of names and descriptions returned by DBW.",
+  description:
+    "Language of names and descriptions returned by DBW. Default: the lang set in the server address (e.g. ?lang=pl), otherwise en.",
 };
 const offset = { type: "integer", minimum: 0, default: 0, description: "Number of items to skip (pagination)." };
 const limit = (def: number, max: number) => ({
@@ -494,8 +495,10 @@ export const tools: ToolDefinition[] = [
       "so each combination costs at least one DBW request; downloaded combinations are cached for 6 hours and then cost " +
       "nothing. The reply lists executed, empty (no data, with reason) and pending combinations. If the request budget " +
       "runs out, partial results are returned with retry_after_seconds: call again with the same arguments to finish. " +
-      "format 'wide' returns one row per position with a column per year (or year+period). Check quota_status first " +
-      "for large requests.",
+      "format 'wide' returns one row per position with a column per year (or year+period). Use dry_run: true first to " +
+      "see a year x period coverage matrix (cached / empty / outside_range / to_fetch) and the exact number of DBW " +
+      "requests the call would cost, without downloading anything. aggregate {fn, window: 'year'} returns yearly " +
+      "mean/sum/min/max computed on the server, with periods_used per value.",
     inputSchema: schema({
       variable_id: dataSelectors.variable_id,
       section_id: dataSelectors.section_id,
@@ -540,6 +543,26 @@ export const tools: ToolDefinition[] = [
         description: "json rows, one csv string, or a wide table (positions x periods).",
       },
       include_codes: includeCodes,
+      dry_run: {
+        type: "boolean",
+        default: false,
+        description: "Only plan: return the coverage matrix and the DBW request cost; downloads nothing.",
+      },
+      aggregate: {
+        type: "object",
+        properties: {
+          fn: { type: "string", enum: [...AGGREGATE_FNS] },
+          window: { type: "string", enum: ["year"], default: "year" },
+          allow_partial: {
+            type: "boolean",
+            default: false,
+            description: "Compute years missing some periods instead of returning null.",
+          },
+        },
+        required: ["fn"],
+        additionalProperties: false,
+        description: "Aggregate the selected periods into one value per year, e.g. {\"fn\": \"mean\"}.",
+      },
     }, ["variable_id", "section_id", "years"]),
     handler: (args, ctx) => withUsage(ctx, (ctx) => getDataSeries(args, ctx)),
   },

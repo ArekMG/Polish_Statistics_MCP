@@ -1,3 +1,4 @@
+import { aggregateByYear, parseAggregate } from "./aggregate.ts";
 import { type Args, boolArg, enumArg, intArg, intListArg, langArg, normalizeText, strListArg } from "./args.ts";
 import { getSectionPositions, type SectionPosition, TERRITORIAL_LEVELS, type TerritorialLevel } from "./catalog.ts";
 import { DBW_MAX_PAGE_SIZE } from "./dbw-client.ts";
@@ -11,7 +12,9 @@ import {
   rowsToCsv,
 } from "./decode.ts";
 import {
+  DATA_TTL,
   type DataRequest,
+  dataPageCacheKey,
   describePeriods,
   fetchDataPage,
   MAX_COMPLETE_ROWS,
@@ -56,6 +59,24 @@ function parseLevels(args: Args): Set<TerritorialLevel> | undefined {
 }
 
 type Combination = { year: number; periodId: number; period: string; periodName: string };
+type CoverageStatus = "cached" | "empty" | "outside_range" | "to_fetch";
+
+const noDataKey = (req: DataRequest) => `nodata|${req.variableId}|${req.sectionId}|${req.year}|${req.periodId}`;
+
+async function coverageOf(ctx: ToolContext, req: DataRequest): Promise<{ status: CoverageStatus; requests: number }> {
+  if (await ctx.cache.has(noDataKey(req))) return { status: "empty", requests: 0 };
+  const first = await ctx.cache.get<{ "page-count"?: number }>(dataPageCacheKey(req, 0, DBW_MAX_PAGE_SIZE));
+  if (!first) return { status: "to_fetch", requests: 1 };
+  let missing = 0;
+  for (let page = 1; page < Math.min(first["page-count"] ?? 1, MAX_PAGES_PER_COMBINATION); page++) {
+    if (!(await ctx.cache.has(dataPageCacheKey(req, page, DBW_MAX_PAGE_SIZE)))) missing++;
+  }
+  return { status: missing ? "to_fetch" : "cached", requests: missing };
+}
+
+function isAnnualPeriod(p: { symbol: string; name: string }) {
+  return /^(rok|year)\b/i.test(normalizeText(p.name)) || (p.symbol === "" && /rok|year|annual/i.test(p.name));
+}
 type Outcome =
   | { status: "ok"; rows: RawDataRow[] }
   | { status: "empty"; reason: string }
@@ -133,6 +154,7 @@ async function resolvePeriods(ctx: ToolContext, args: Args, sectionPeriodIds: nu
 }
 
 async function fetchCombination(ctx: ToolContext, req: DataRequest): Promise<Outcome> {
+  if (await ctx.cache.has(noDataKey(req))) return { status: "empty", reason: "no data published for this year and period" };
   try {
     const first = await fetchDataPage(ctx, req, 0, DBW_MAX_PAGE_SIZE);
     if (first.pageCount > MAX_PAGES_PER_COMBINATION) {
@@ -144,7 +166,10 @@ async function fetchCombination(ctx: ToolContext, req: DataRequest): Promise<Out
     }
     return { status: "ok", rows };
   } catch (err) {
-    if (isToolError(err, "NO_DATA")) return { status: "empty", reason: "no data published for this year and period" };
+    if (isToolError(err, "NO_DATA")) {
+      await ctx.cache.set(noDataKey(req), true, DATA_TTL);
+      return { status: "empty", reason: "no data published for this year and period" };
+    }
     throw err;
   }
 }
@@ -177,6 +202,8 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   const levels = parseLevels(args);
   const format = enumArg(args, "format", ["json", "csv", "wide"] as const, "json");
   const includeCodes = boolArg(args, "include_codes", false);
+  const dryRun = boolArg(args, "dry_run", false);
+  const aggregate = parseAggregate(args);
   const lang = langArg(args);
 
   const { variable, section, range } = await resolveSection(ctx, variableId, sectionId, lang);
@@ -194,6 +221,69 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   const dicts = await getDecodingDictionaries(ctx.client, lang);
   const decode = createRowDecoder(dicts, positions, includeCodes);
   const dimensions = dimensionOrder(positions);
+  const requestFor = (c: Combination): DataRequest => ({
+    variableId,
+    variableName: variable.name,
+    sectionId,
+    sectionName: section.name,
+    year: c.year,
+    periodId: c.periodId,
+    lang,
+  });
+  const outsideRange = (c: Combination) => Boolean(range && (c.year < range.from || c.year > range.to));
+  const periodLabel = (p: { period: string; periodName: string }) => p.period || p.periodName;
+
+  const periodDict = await getDictionary(ctx.client, "periods", lang);
+  const annualIds = section.periodIds.filter((id) => {
+    const p = periodDict.find((d) => d.id === id);
+    return p !== undefined && isAnnualPeriod(p);
+  });
+  const chosenIds = periods.map((p) => p.periodId);
+  const annualWarning = aggregate && annualIds.length && !annualIds.every((id) => chosenIds.includes(id))
+    ? `This section also publishes an official annual value (period_ids ${annualIds.join(", ")}). ` +
+      `Prefer it over a computed ${aggregate.fn}, which may differ methodologically.`
+    : undefined;
+
+  if (dryRun) {
+    const matrix: Record<string, Record<string, CoverageStatus>> = {};
+    const counts: Record<CoverageStatus, number> = { cached: 0, empty: 0, outside_range: 0, to_fetch: 0 };
+    let estimated = 0;
+    for (const c of combos) {
+      const cov = outsideRange(c) ? { status: "outside_range" as const, requests: 0 } : await coverageOf(ctx, requestFor(c));
+      (matrix[String(c.year)] ??= {})[periodLabel(c)] = cov.status;
+      counts[cov.status]++;
+      estimated += cov.requests;
+    }
+    const quota = await ctx.client.quota();
+    const tightest = quota?.filter((q) => q.window_seconds > 1).sort((a, b) => a.remaining - b.remaining)[0];
+    return {
+      variable_id: variableId,
+      variable_name: variable.name,
+      section_id: sectionId,
+      section_name: section.name,
+      lang,
+      dry_run: true,
+      published_years: range ? { from: range.from, to: range.to } : null,
+      periods: periods.map((p) => ({ period_id: p.periodId, period: periodLabel(p) })),
+      coverage: matrix,
+      coverage_counts: counts,
+      legend: {
+        cached: "already downloaded; costs nothing",
+        empty: "checked earlier: DBW has no data",
+        outside_range: "outside the published years; skipped for free",
+        to_fetch: "not downloaded yet; availability unknown until fetched",
+      },
+      estimated_dbw_requests: {
+        minimum: estimated,
+        note: "Each to_fetch combination costs 1 request per 5000 rows; most cost exactly 1. " +
+          "Combinations with no data also cost 1 the first time, then are remembered.",
+      },
+      ...(tightest
+        ? { fits_in_budget: estimated <= tightest.remaining, tightest_limit: tightest }
+        : {}),
+      ...(annualWarning ? { warning: annualWarning } : {}),
+    };
+  }
 
   const outcomes: Outcome[] = new Array(combos.length);
   let retryAfter: number | undefined;
@@ -206,8 +296,8 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     while (next < combos.length) {
       const i = next++;
       const c = combos[i];
-      if (range && (c.year < range.from || c.year > range.to)) {
-        outcomes[i] = { status: "empty", reason: `outside the published time series (${range.from}-${range.to})` };
+      if (outsideRange(c)) {
+        outcomes[i] = { status: "empty", reason: `outside the published time series (${range!.from}-${range!.to})` };
         continue;
       }
       if (rateError) {
@@ -222,15 +312,7 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
         outcomes[i] = { status: "pending", reason: `row limit of ${MAX_COMPLETE_ROWS} reached` };
         continue;
       }
-      const req: DataRequest = {
-        variableId,
-        variableName: variable.name,
-        sectionId,
-        sectionName: section.name,
-        year: c.year,
-        periodId: c.periodId,
-        lang,
-      };
+      const req = requestFor(c);
       try {
         const out = await fetchCombination(ctx, req);
         if (out.status === "ok" && keep) out.rows = out.rows.filter(keep);
@@ -251,7 +333,7 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-  const describe = (c: Combination) => ({ year: c.year, period_id: c.periodId, period: c.period || c.periodName });
+  const describe = (c: Combination) => ({ year: c.year, period_id: c.periodId, period: periodLabel(c) });
   const label = (c: Combination) => (periods.length === 1 || !c.period ? String(c.year) : `${c.year} ${c.period}`);
   const executed: Record<string, unknown>[] = [];
   const empty: Record<string, unknown>[] = [];
@@ -273,7 +355,28 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     });
   }
 
-  const decoded = groups.flatMap((g) => g.rows);
+  let decoded: DecodedRow[] = groups.flatMap((g) => g.rows);
+  let outputGroups = groups;
+  let aggregation: Record<string, unknown> | undefined;
+  if (aggregate) {
+    const result = aggregateByYear(decoded, dimensions, aggregate, periods.length);
+    decoded = result.rows;
+    outputGroups = [...new Set(result.rows.map((r) => r.year))].map((year) => ({
+      label: String(year),
+      rows: result.rows.filter((r) => r.year === year),
+    }));
+    aggregation = {
+      fn: aggregate.fn,
+      window: "year",
+      periods_expected_per_year: periods.length,
+      allow_partial: aggregate.allowPartial,
+      incomplete_groups: result.incomplete,
+      note: aggregate.allowPartial
+        ? "Incomplete years are computed from the available periods; check periods_used."
+        : "Years missing any period have value null; set allow_partial: true to compute them anyway.",
+      ...(annualWarning ? { warning: annualWarning } : {}),
+    };
+  }
 
   return {
     variable_id: variableId,
@@ -303,10 +406,11 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     returned_rows: decoded.length,
     format,
     dimensions,
+    ...(aggregation ? { aggregation } : {}),
     ...(format === "csv"
       ? { csv: rowsToCsv(decoded, dimensions) }
       : format === "wide"
-      ? toWide(groups, dimensions)
+      ? toWide(outputGroups, dimensions)
       : { rows: decoded }),
   };
 }

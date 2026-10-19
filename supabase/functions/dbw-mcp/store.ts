@@ -1,6 +1,7 @@
 export interface Cache {
   get<T>(key: string): Promise<T | undefined>;
   set(key: string, value: unknown, ttlSeconds: number): Promise<void>;
+  has(key: string): Promise<boolean>;
 }
 
 export type RateRule = { bucket: string; windowSeconds: number; limit: number };
@@ -41,6 +42,18 @@ export function createSupabaseStore(supabaseUrl: string, serviceKey: string, fet
       } catch (err) {
         console.error("cache read error", err);
         return undefined;
+      }
+    },
+    async has(key: string) {
+      try {
+        const url = `${base}/mcp_dbw_cache?select=cache_key&cache_key=eq.${encodeURIComponent(key)}` +
+          `&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&limit=1`;
+        const res = await fetchImpl(url, { headers });
+        if (!res.ok) return false;
+        return ((await res.json()) as unknown[]).length > 0;
+      } catch (err) {
+        console.error("cache lookup error", err);
+        return false;
       }
     },
     async set(key: string, value: unknown, ttlSeconds: number) {

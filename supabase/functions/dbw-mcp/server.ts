@@ -11,7 +11,9 @@ const INSTRUCTIONS =
   "get_variable_metadata / list_sections_and_periods -> get_section_dimensions -> estimate_data_size -> " +
   "preview_data -> get_data_page or get_complete_data. For several years or periods use get_data_series (one call, " +
   "optional levels/position_ids filter, format 'wide' for a ready table) instead of many single-period calls. " +
-  "DBW requests are a shared, limited budget: check quota_status before large downloads; downloaded data is cached. " +
+  "DBW requests are a shared, limited budget: check quota_status before large downloads, and use get_data_series with " +
+  "dry_run: true to see coverage and cost first; downloaded data is cached. A default language can be set once in the " +
+  "server address (?lang=pl or ?lang=en); a lang argument in a call overrides it. " +
   "All ids are DBW integers. Errors include a code and a hint.";
 
 export const corsHeaders = {
@@ -95,15 +97,19 @@ function toolListing(tools: ToolDefinition[]) {
   }));
 }
 
-async function callTool(deps: ServerDeps, params: Record<string, unknown>) {
+type DefaultLang = "en" | "pl" | undefined;
+
+async function callTool(deps: ServerDeps, params: Record<string, unknown>, defaultLang: DefaultLang) {
   const tool = deps.tools.find((t) => t.name === params.name);
   if (!tool) return { error: { code: -32602, message: `Unknown tool: ${String(params.name)}` } };
   const args = params.arguments ?? {};
   if (typeof args !== "object" || Array.isArray(args) || args === null) {
     return { result: toolErrorResult(new ToolError("INVALID_ARGUMENT", "Tool arguments must be an object.")) };
   }
+  const record = args as Record<string, unknown>;
+  const finalArgs = defaultLang && record.lang === undefined ? { ...record, lang: defaultLang } : record;
   try {
-    return { result: toolResult(await tool.handler(args as Record<string, unknown>, deps.context)) };
+    return { result: toolResult(await tool.handler(finalArgs, deps.context)) };
   } catch (err) {
     if (isToolError(err)) return { result: toolErrorResult(err) };
     console.error(`tool ${tool.name} failed`, err);
@@ -115,7 +121,7 @@ async function callTool(deps: ServerDeps, params: Record<string, unknown>) {
   }
 }
 
-async function handleMessage(deps: ServerDeps, msg: JsonRpcMessage): Promise<unknown | undefined> {
+async function handleMessage(deps: ServerDeps, msg: JsonRpcMessage, defaultLang: DefaultLang): Promise<unknown | undefined> {
   const isRequest = msg.id !== undefined && msg.id !== null;
   const id = (isRequest ? msg.id : null) as JsonRpcId;
   if (msg.jsonrpc !== "2.0" || (typeof msg.method !== "string" && msg.result === undefined && msg.error === undefined)) {
@@ -145,7 +151,7 @@ async function handleMessage(deps: ServerDeps, msg: JsonRpcMessage): Promise<unk
     case "tools/list":
       return { jsonrpc: "2.0", id, result: { tools: toolListing(deps.tools) } };
     case "tools/call": {
-      const out = await callTool(deps, params);
+      const out = await callTool(deps, params, defaultLang);
       return "error" in out ? { jsonrpc: "2.0", id, error: out.error } : { jsonrpc: "2.0", id, result: out.result };
     }
     case "resources/list":
@@ -200,6 +206,12 @@ export function createMcpHandler(deps: ServerDeps) {
       );
     }
 
+    const langParam = new URL(req.url).searchParams.get("lang");
+    if (langParam !== null && langParam !== "en" && langParam !== "pl") {
+      return json(rpcError(null, -32600, 'The "lang" setting in the server address must be "en" or "pl".'), 400);
+    }
+    const defaultLang: DefaultLang = langParam ?? undefined;
+
     const raw = await req.text();
     if (new TextEncoder().encode(raw).length > MAX_BODY_BYTES) {
       return json(rpcError(null, -32600, "Request body too large."), 413);
@@ -221,7 +233,7 @@ export function createMcpHandler(deps: ServerDeps) {
         responses.push(rpcError(null, -32600, "Invalid JSON-RPC 2.0 message."));
         continue;
       }
-      const out = await handleMessage(deps, m as JsonRpcMessage);
+      const out = await handleMessage(deps, m as JsonRpcMessage, defaultLang);
       if (out !== undefined) responses.push(out);
     }
 
