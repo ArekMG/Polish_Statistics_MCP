@@ -498,7 +498,8 @@ export const tools: ToolDefinition[] = [
       "format 'wide' returns one row per position with a column per year (or year+period). Use dry_run: true first to " +
       "see a year x period coverage matrix (cached / empty / outside_range / to_fetch) and the exact number of DBW " +
       "requests the call would cost, without downloading anything. aggregate {fn, window: 'year'} returns yearly " +
-      "mean/sum/min/max computed on the server, with periods_used per value.",
+      "mean/sum/min/max computed on the server, or first/last (e.g. last = state at the end of the year), with " +
+      "periods_used per value. include_executed: false keeps the reply short (only counts, plus empty/pending lists).",
     inputSchema: schema({
       variable_id: dataSelectors.variable_id,
       section_id: dataSelectors.section_id,
@@ -548,6 +549,11 @@ export const tools: ToolDefinition[] = [
         default: false,
         description: "Only plan: return the coverage matrix and the DBW request cost; downloads nothing.",
       },
+      include_executed: {
+        type: "boolean",
+        default: true,
+        description: "List every downloaded combination. Set false to return only executed_count.",
+      },
       aggregate: {
         type: "object",
         properties: {
@@ -561,7 +567,7 @@ export const tools: ToolDefinition[] = [
         },
         required: ["fn"],
         additionalProperties: false,
-        description: "Aggregate the selected periods into one value per year, e.g. {\"fn\": \"mean\"}.",
+        description: "Aggregate the selected periods into one value per year, e.g. {\"fn\": \"mean\"} or {\"fn\": \"last\"}.",
       },
     }, ["variable_id", "section_id", "years"]),
     handler: (args, ctx) => withUsage(ctx, (ctx) => getDataSeries(args, ctx)),

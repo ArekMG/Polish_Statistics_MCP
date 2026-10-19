@@ -1,7 +1,8 @@
 export interface Cache {
   get<T>(key: string): Promise<T | undefined>;
   set(key: string, value: unknown, ttlSeconds: number): Promise<void>;
-  has(key: string): Promise<boolean>;
+  // Maps each cached key to the DBW "page-count" stored in it (null when absent); missing keys are not cached.
+  presence(keys: string[]): Promise<Map<string, number | null>>;
 }
 
 export type RateRule = { bucket: string; windowSeconds: number; limit: number };
@@ -44,17 +45,27 @@ export function createSupabaseStore(supabaseUrl: string, serviceKey: string, fet
         return undefined;
       }
     },
-    async has(key: string) {
+    async presence(keys: string[]) {
+      const out = new Map<string, number | null>();
+      if (keys.length === 0) return out;
       try {
-        const url = `${base}/mcp_dbw_cache?select=cache_key&cache_key=eq.${encodeURIComponent(key)}` +
-          `&expires_at=gt.${encodeURIComponent(new Date().toISOString())}&limit=1`;
-        const res = await fetchImpl(url, { headers });
-        if (!res.ok) return false;
-        return ((await res.json()) as unknown[]).length > 0;
+        const res = await fetchImpl(`${base}/rpc/mcp_cache_presence`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ p_keys: keys }),
+        });
+        if (!res.ok) {
+          console.error("cache presence failed", res.status);
+          return out;
+        }
+        const rows = await res.json() as { cache_key: string; page_count: number | null }[];
+        if (Array.isArray(rows)) {
+          for (const r of rows) out.set(String(r.cache_key), typeof r.page_count === "number" ? r.page_count : null);
+        }
       } catch (err) {
-        console.error("cache lookup error", err);
-        return false;
+        console.error("cache presence error", err);
       }
+      return out;
     },
     async set(key: string, value: unknown, ttlSeconds: number) {
       try {

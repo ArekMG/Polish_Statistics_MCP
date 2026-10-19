@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { aggregateByYear } from "../aggregate.ts";
+import { aggregateByYear, periodRank } from "../aggregate.ts";
 import type { DecodedRow } from "../decode.ts";
 import { setup } from "./helpers.ts";
 
@@ -56,15 +56,38 @@ test("aggregateByYear leaves incomplete years empty unless allow_partial", () =>
     row: 1, year: 2023, period, period_name: period, dimensions: { Region: "A" }, value, precision: 1, unit: "%",
   });
   const rows = [row("M01", 2), row("M02", 4), row("M03", null)];
-  const strict = aggregateByYear(rows, ["Region"], { fn: "mean", window: "year", allowPartial: false }, 3);
+  const rank = (r: DecodedRow) => periodRank(r.period, 0);
+  const strict = aggregateByYear(rows, ["Region"], { fn: "mean", window: "year", allowPartial: false }, 3, rank);
   assert.equal(strict.rows[0].value, null);
   assert.equal(strict.rows[0].periods_used, 2);
   assert.equal(strict.incomplete, 1);
-  const partial = aggregateByYear(rows, ["Region"], { fn: "mean", window: "year", allowPartial: true }, 3);
+  const partial = aggregateByYear(rows, ["Region"], { fn: "mean", window: "year", allowPartial: true }, 3, rank);
   assert.equal(partial.rows[0].value, 3);
-  const sum = aggregateByYear(rows.slice(0, 2), ["Region"], { fn: "sum", window: "year", allowPartial: false }, 2);
+  const sum = aggregateByYear(rows.slice(0, 2), ["Region"], { fn: "sum", window: "year", allowPartial: false }, 2, rank);
   assert.equal(sum.rows[0].value, 6);
   assert.equal(sum.rows[0].complete, true);
+});
+
+test("first and last follow calendar order, not input order", () => {
+  const row = (period: string, value: number): DecodedRow => ({
+    row: 1, year: 2023, period, period_name: period, dimensions: { Region: "A" }, value, precision: 1, unit: "%",
+  });
+  const rows = [row("M12", 9), row("M02", 4), row("M10", 7)];
+  const rank = (r: DecodedRow) => periodRank(r.period, 0);
+  const last = aggregateByYear(rows, ["Region"], { fn: "last", window: "year", allowPartial: false }, 3, rank).rows[0];
+  assert.equal(last.value, 9);
+  assert.equal(last.source_period, "M12");
+  const first = aggregateByYear(rows, ["Region"], { fn: "first", window: "year", allowPartial: false }, 3, rank).rows[0];
+  assert.equal(first.value, 4);
+  assert.ok(periodRank("Q4", 1) > periodRank("M11", 999));
+});
+
+test("include_executed: false returns only the count", async () => {
+  const { call } = setup();
+  const out = (await call("get_data_series", { ...SERIES, include_executed: false })).structuredContent;
+  assert.equal(out.executed, undefined);
+  assert.equal(out.executed_count, 2);
+  assert.ok(Array.isArray(out.empty));
 });
 
 test("default language comes from the server address and can be overridden per call", async () => {

@@ -1,4 +1,4 @@
-import { aggregateByYear, parseAggregate } from "./aggregate.ts";
+import { aggregateByYear, parseAggregate, periodRank } from "./aggregate.ts";
 import { type Args, boolArg, enumArg, intArg, intListArg, langArg, normalizeText, strListArg } from "./args.ts";
 import { getSectionPositions, type SectionPosition, TERRITORIAL_LEVELS, type TerritorialLevel } from "./catalog.ts";
 import { DBW_MAX_PAGE_SIZE } from "./dbw-client.ts";
@@ -63,15 +63,23 @@ type CoverageStatus = "cached" | "empty" | "outside_range" | "to_fetch";
 
 const noDataKey = (req: DataRequest) => `nodata|${req.variableId}|${req.sectionId}|${req.year}|${req.periodId}`;
 
-async function coverageOf(ctx: ToolContext, req: DataRequest): Promise<{ status: CoverageStatus; requests: number }> {
-  if (await ctx.cache.has(noDataKey(req))) return { status: "empty", requests: 0 };
-  const first = await ctx.cache.get<{ "page-count"?: number }>(dataPageCacheKey(req, 0, DBW_MAX_PAGE_SIZE));
-  if (!first) return { status: "to_fetch", requests: 1 };
-  let missing = 0;
-  for (let page = 1; page < Math.min(first["page-count"] ?? 1, MAX_PAGES_PER_COMBINATION); page++) {
-    if (!(await ctx.cache.has(dataPageCacheKey(req, page, DBW_MAX_PAGE_SIZE)))) missing++;
-  }
-  return { status: missing ? "to_fetch" : "cached", requests: missing };
+type Coverage = { status: CoverageStatus; requests: number };
+
+// Two batched cache lookups for the whole selection, whatever its size.
+async function planCoverage(ctx: ToolContext, reqs: DataRequest[]): Promise<Coverage[]> {
+  const firstKeys = reqs.map((r) => dataPageCacheKey(r, 0, DBW_MAX_PAGE_SIZE));
+  const found = await ctx.cache.presence([...reqs.map(noDataKey), ...firstKeys]);
+  const extraKeys = reqs.map((r, i) => {
+    const pageCount = Math.min(found.get(firstKeys[i]) ?? 1, MAX_PAGES_PER_COMBINATION);
+    return Array.from({ length: Math.max(pageCount - 1, 0) }, (_, p) => dataPageCacheKey(r, p + 1, DBW_MAX_PAGE_SIZE));
+  });
+  const extraFound = extraKeys.some((k) => k.length) ? await ctx.cache.presence(extraKeys.flat()) : new Map();
+  return reqs.map((r, i) => {
+    if (found.has(noDataKey(r))) return { status: "empty", requests: 0 };
+    if (!found.has(firstKeys[i])) return { status: "to_fetch", requests: 1 };
+    const missing = extraKeys[i].filter((k) => !extraFound.has(k)).length;
+    return { status: missing ? "to_fetch" : "cached", requests: missing };
+  });
 }
 
 function isAnnualPeriod(p: { symbol: string; name: string }) {
@@ -154,7 +162,6 @@ async function resolvePeriods(ctx: ToolContext, args: Args, sectionPeriodIds: nu
 }
 
 async function fetchCombination(ctx: ToolContext, req: DataRequest): Promise<Outcome> {
-  if (await ctx.cache.has(noDataKey(req))) return { status: "empty", reason: "no data published for this year and period" };
   try {
     const first = await fetchDataPage(ctx, req, 0, DBW_MAX_PAGE_SIZE);
     if (first.pageCount > MAX_PAGES_PER_COMBINATION) {
@@ -203,6 +210,7 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   const format = enumArg(args, "format", ["json", "csv", "wide"] as const, "json");
   const includeCodes = boolArg(args, "include_codes", false);
   const dryRun = boolArg(args, "dry_run", false);
+  const includeExecuted = boolArg(args, "include_executed", true);
   const aggregate = parseAggregate(args);
   const lang = langArg(args);
 
@@ -248,8 +256,11 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     const matrix: Record<string, Record<string, CoverageStatus>> = {};
     const counts: Record<CoverageStatus, number> = { cached: 0, empty: 0, outside_range: 0, to_fetch: 0 };
     let estimated = 0;
+    const inRange = combos.filter((c) => !outsideRange(c));
+    const plan = await planCoverage(ctx, inRange.map(requestFor));
     for (const c of combos) {
-      const cov = outsideRange(c) ? { status: "outside_range" as const, requests: 0 } : await coverageOf(ctx, requestFor(c));
+      const idx = inRange.indexOf(c);
+      const cov: Coverage = idx === -1 ? { status: "outside_range", requests: 0 } : plan[idx];
       (matrix[String(c.year)] ??= {})[periodLabel(c)] = cov.status;
       counts[cov.status]++;
       estimated += cov.requests;
@@ -286,6 +297,7 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   }
 
   const outcomes: Outcome[] = new Array(combos.length);
+  const knownEmpty = await ctx.cache.presence(combos.map((c) => noDataKey(requestFor(c))));
   let retryAfter: number | undefined;
   let rateError: ToolError | undefined;
   let keptRows = 0;
@@ -298,6 +310,10 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       const c = combos[i];
       if (outsideRange(c)) {
         outcomes[i] = { status: "empty", reason: `outside the published time series (${range!.from}-${range!.to})` };
+        continue;
+      }
+      if (knownEmpty.has(noDataKey(requestFor(c)))) {
+        outcomes[i] = { status: "empty", reason: "no data published for this year and period" };
         continue;
       }
       if (rateError) {
@@ -359,7 +375,8 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   let outputGroups = groups;
   let aggregation: Record<string, unknown> | undefined;
   if (aggregate) {
-    const result = aggregateByYear(decoded, dimensions, aggregate, periods.length);
+    const ranks = new Map(periods.map((p) => [p.period || String(p.periodId), periodRank(p.period, p.periodId)]));
+    const result = aggregateByYear(decoded, dimensions, aggregate, periods.length, (r) => ranks.get(r.period) ?? 0);
     decoded = result.rows;
     outputGroups = [...new Set(result.rows.map((r) => r.year))].map((year) => ({
       label: String(year),
@@ -391,7 +408,8 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       levels: levels ? [...levels] : null,
     },
     complete: pending.length === 0,
-    executed,
+    executed: includeExecuted ? executed : undefined,
+    executed_count: executed.length,
     empty,
     pending,
     ...(pending.length

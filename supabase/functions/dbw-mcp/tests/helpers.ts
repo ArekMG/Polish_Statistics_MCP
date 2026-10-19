@@ -8,7 +8,15 @@ export function memoryCache(): Cache & { store: Map<string, unknown> } {
   return {
     store,
     get: <T>(key: string) => Promise.resolve(store.get(key) as T | undefined),
-    has: (key: string) => Promise.resolve(store.has(key)),
+    presence: (keys: string[]) => {
+      const out = new Map<string, number | null>();
+      for (const k of keys) {
+        if (!store.has(k)) continue;
+        const pc = (store.get(k) as { "page-count"?: unknown } | null)?.["page-count"];
+        out.set(k, typeof pc === "number" ? pc : null);
+      }
+      return Promise.resolve(out);
+    },
     set: (key: string, value: unknown) => {
       store.set(key, structuredClone(value));
       return Promise.resolve();
