@@ -1,0 +1,482 @@
+import {
+  type Args,
+  boolArg,
+  enumArg,
+  intArg,
+  langArg,
+  matchesQuery,
+  paginate,
+  strArg,
+} from "./args.ts";
+import { type Area, getAreas, getAreaVariables, getCatalog, getSectionPositions, getVariableMeta } from "./catalog.ts";
+import { DBW_MAX_PAGE_SIZE } from "./dbw-client.ts";
+import { DICTIONARY_NAMES, type DecodedRow, getDictionary, rowsToCsv, stripHtml } from "./decode.ts";
+import {
+  countRows,
+  createDecoderFor,
+  fetchDataPage,
+  findCatalogVariable,
+  MAX_COMPLETE_ROWS,
+  parseYearRange,
+  PREVIEW_ROWS,
+  requestSummary,
+  resolveDataRequest,
+  sectionMetaList,
+  type ToolContext,
+} from "./data.ts";
+import { ToolError } from "./errors.ts";
+
+export type { ToolContext } from "./data.ts";
+
+export type ToolDefinition = {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  handler: (args: Args, ctx: ToolContext) => Promise<Record<string, unknown>>;
+};
+
+const lang = {
+  type: "string",
+  enum: ["en", "pl"],
+  default: "en",
+  description: "Language of names and descriptions returned by DBW.",
+};
+const offset = { type: "integer", minimum: 0, default: 0, description: "Number of items to skip (pagination)." };
+const limit = (def: number, max: number) => ({
+  type: "integer",
+  minimum: 1,
+  maximum: max,
+  default: def,
+  description: `Maximum items to return (1-${max}).`,
+});
+const id = (description: string) => ({ type: "integer", minimum: 1, description });
+const dataSelectors = {
+  variable_id: id("Variable id (from find_variables)."),
+  section_id: id("Section (cross-section) id for the variable (from list_sections_and_periods)."),
+  year: { type: "integer", minimum: 1800, maximum: 2200, description: "Year, e.g. 2023." },
+  period_id: id("Period id available for the section (from list_sections_and_periods)."),
+};
+const formatProp = (def: "json" | "csv") => ({
+  type: "string",
+  enum: ["json", "csv"],
+  default: def,
+  description: "json returns decoded row objects; csv returns one compact CSV string.",
+});
+const includeCodes = {
+  type: "boolean",
+  default: false,
+  description: "Also include the raw DBW codes for each row.",
+};
+const dataRequired = ["variable_id", "section_id", "year", "period_id"];
+
+function schema(properties: Record<string, unknown>, required: string[] = []) {
+  return { type: "object", properties: { ...properties, lang }, required, additionalProperties: false };
+}
+
+function areaPath(area: Area, byId: Map<number, Area>): string {
+  const names = [area.name];
+  const seen = new Set([area.id]);
+  let parent = area.parentId === null ? undefined : byId.get(area.parentId);
+  while (parent && !seen.has(parent.id)) {
+    names.unshift(parent.name);
+    seen.add(parent.id);
+    parent = parent.parentId === null ? undefined : byId.get(parent.parentId);
+  }
+  return names.join(" > ");
+}
+
+function formatRows(rows: DecodedRow[], format: "json" | "csv", dimensions: string[]) {
+  return format === "csv" ? { format, dimensions, csv: rowsToCsv(rows, dimensions) } : { format, dimensions, rows };
+}
+
+function cleanDeep(value: unknown): unknown {
+  if (typeof value === "string") return stripHtml(value);
+  if (Array.isArray(value)) return value.map(cleanDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, cleanDeep(v)]));
+  }
+  return value;
+}
+
+function list(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter((v) => v && typeof v === "object") : [];
+}
+
+export const tools: ToolDefinition[] = [
+  {
+    name: "search_areas",
+    title: "Search DBW subject areas",
+    description:
+      "Browse or search the DBW subject-area tree (domains and information scopes). Start here to discover topics. " +
+      "Areas with has_variables=true can be passed to find_variables.",
+    inputSchema: schema({
+      query: { type: "string", description: "Words to match in the area name or its parent path (accent-insensitive)." },
+      parent_id: id("Only return direct children of this area."),
+      has_variables: { type: "boolean", description: "Only return areas that directly contain variables." },
+      offset,
+      limit: limit(50, 200),
+    }),
+    async handler(args, ctx) {
+      const query = strArg(args, "query");
+      const parentId = intArg(args, "parent_id", { min: 1 });
+      const onlyWithVariables = args.has_variables === undefined ? undefined : boolArg(args, "has_variables", false);
+      const off = intArg(args, "offset", { min: 0, default: 0 })!;
+      const lim = intArg(args, "limit", { min: 1, max: 200, default: 50 })!;
+      const areas = await getAreas(ctx.client, langArg(args));
+      const byId = new Map(areas.map((a) => [a.id, a]));
+      const matches = areas
+        .filter((a) => parentId === undefined || a.parentId === parentId)
+        .filter((a) => onlyWithVariables === undefined || a.hasVariables === onlyWithVariables)
+        .map((a) => ({ area: a, path: areaPath(a, byId) }))
+        .filter(({ path }) => matchesQuery(path, query));
+      const page = paginate(matches, off, lim);
+      return {
+        total: page.total,
+        offset: page.offset,
+        limit: page.limit,
+        next_offset: page.next_offset,
+        areas: page.items.map(({ area, path }) => ({
+          area_id: area.id,
+          name: area.name,
+          path,
+          parent_id: area.parentId,
+          level: area.level,
+          level_name: area.levelName,
+          has_variables: area.hasVariables,
+        })),
+      };
+    },
+  },
+  {
+    name: "find_variables",
+    title: "Find DBW variables",
+    description:
+      "Find statistical variables either inside an area (area_id) or by searching variable and section names across " +
+      "all of DBW (query). Provide at least one of them.",
+    inputSchema: schema({
+      area_id: id("Area id from search_areas (must have has_variables=true)."),
+      query: { type: "string", description: "Words to match in variable or section names (accent-insensitive)." },
+      offset,
+      limit: limit(50, 200),
+    }),
+    async handler(args, ctx) {
+      const areaId = intArg(args, "area_id", { min: 1 });
+      const query = strArg(args, "query");
+      const off = intArg(args, "offset", { min: 0, default: 0 })!;
+      const lim = intArg(args, "limit", { min: 1, max: 200, default: 50 })!;
+      const lng = langArg(args);
+      if (areaId === undefined && !query) {
+        throw new ToolError("INVALID_ARGUMENT", 'Provide "area_id", "query", or both.', {
+          hint: "Use search_areas to find an area id, or pass a search phrase as query.",
+        });
+      }
+      let variables: Record<string, unknown>[];
+      if (areaId !== undefined) {
+        variables = (await getAreaVariables(ctx.client, areaId, lng)).filter((v) => matchesQuery(v.name, query));
+      } else {
+        const catalog = await getCatalog(ctx.client, ctx.cache, lng);
+        const byName = catalog.filter((v) => matchesQuery(v.name, query));
+        const bySection = catalog.filter((v) =>
+          !matchesQuery(v.name, query) && matchesQuery(`${v.name} ${v.sections.map((s) => s.name).join(" ")}`, query)
+        );
+        variables = [...byName, ...bySection]
+          .map((v) => ({ variable_id: v.id, name: v.name, section_count: v.sections.length }));
+      }
+      const page = paginate(variables, off, lim);
+      return { total: page.total, offset: page.offset, limit: page.limit, next_offset: page.next_offset, variables: page.items };
+    },
+  },
+  {
+    name: "get_variable_metadata",
+    title: "Get variable metadata",
+    description:
+      "Full metadata for a variable: definitions, methodological notes, sections with time coverage and last update, " +
+      "source surveys, datasets and responsible units. HTML is converted to plain text.",
+    inputSchema: schema({
+      variable_id: dataSelectors.variable_id,
+      include_definitions: {
+        type: "boolean",
+        default: true,
+        description: "Include long concept definitions and methodological notes.",
+      },
+    }, ["variable_id"]),
+    async handler(args, ctx) {
+      const variableId = intArg(args, "variable_id", { required: true, min: 1 });
+      const withDefinitions = boolArg(args, "include_definitions", true);
+      const meta = await getVariableMeta(ctx.client, variableId, langArg(args));
+      return {
+        variable_id: meta["id-zmienna"] ?? variableId,
+        name: meta.nazwa,
+        short_name: meta["nazwa-skrocona"],
+        tags: list(meta.tagi).map((t) => t["nazwa-tag"]),
+        concepts: list(meta.pojecia).map((c) => ({
+          name: c["nazwa-pojecie"],
+          ...(withDefinitions
+            ? { definition: stripHtml(String(c.definicja ?? "")), remarks: stripHtml(String(c.uwagi ?? "")) }
+            : {}),
+        })),
+        ...(withDefinitions ? { methodology: cleanDeep(meta["wyjasnienia-metodologiczne"] ?? null) } : {}),
+        sections: sectionMetaList(meta).map((s) => ({
+          section_id: s["id-przekroj"],
+          name: s["nazwa-przekroj"],
+          time_series: s["szereg-czasowy"],
+          frequency: s["nazwa-czestotliwosc"],
+          last_update: s["aktualizacja-ostatnia"],
+        })),
+        datasets: list(meta.zestawy).map((z) => ({
+          symbol: z["symbol-zestaw"],
+          name: z["nazwa-zestaw"],
+          manager: z["nazwa-gestor"],
+        })),
+        surveys: list(meta.badania).map((b) => ({ symbol: b["symbol-badanie"], topic: b["temat-badanie"] })),
+        legal_acts: cleanDeep(list(meta["akty-prawne"]).filter((a) => Object.keys(a).length > 0)),
+        responsible_units: list(meta.jednostki).map((j) => j["nazwa-jednostki"]),
+      };
+    },
+  },
+  {
+    name: "list_sections_and_periods",
+    title: "List available sections and periods",
+    description:
+      "For a variable, list every section (cross-section/breakdown) with its available periods (month, quarter, " +
+      "year...), frequency and covered years. Use the ids with estimate_data_size and the data tools.",
+    inputSchema: schema({ variable_id: dataSelectors.variable_id }, ["variable_id"]),
+    async handler(args, ctx) {
+      const variableId = intArg(args, "variable_id", { required: true, min: 1 });
+      const lng = langArg(args);
+      const variable = await findCatalogVariable(ctx, variableId, lng);
+      const meta = await getVariableMeta(ctx.client, variableId, lng);
+      const sectionMeta = new Map(sectionMetaList(meta).map((s) => [s["id-przekroj"], s]));
+      const periods = new Map((await getDictionary(ctx.client, "periods", lng)).map((p) => [p.id, p]));
+      return {
+        variable_id: variable.id,
+        name: variable.name,
+        sections: variable.sections.map((s) => {
+          const m = sectionMeta.get(s.id);
+          return {
+            section_id: s.id,
+            name: s.name,
+            frequency: m?.["nazwa-czestotliwosc"] ?? null,
+            time_series: m?.["szereg-czasowy"] ?? null,
+            years: parseYearRange(m?.["szereg-czasowy"]),
+            last_update: m?.["aktualizacja-ostatnia"] ?? null,
+            periods: s.periodIds.map((pid) => ({
+              period_id: pid,
+              symbol: periods.get(pid)?.symbol ?? null,
+              name: periods.get(pid)?.name ?? null,
+            })),
+          };
+        }),
+        note: "Not every year in the range is guaranteed to have data for every period; use estimate_data_size to check.",
+      };
+    },
+  },
+  {
+    name: "get_section_dimensions",
+    title: "Get section dimensions",
+    description:
+      "List the dimensions of a section (e.g. Sex, Voivodeship, Age group) and their positions (categories). " +
+      "Positions are paginated; filter with dimension_id or query.",
+    inputSchema: schema({
+      section_id: dataSelectors.section_id,
+      dimension_id: id("Only return positions of this dimension."),
+      query: { type: "string", description: "Words to match in position names." },
+      offset,
+      limit: limit(200, 1000),
+    }, ["section_id"]),
+    async handler(args, ctx) {
+      const sectionId = intArg(args, "section_id", { required: true, min: 1 });
+      const dimensionId = intArg(args, "dimension_id", { min: 1 });
+      const query = strArg(args, "query");
+      const off = intArg(args, "offset", { min: 0, default: 0 })!;
+      const lim = intArg(args, "limit", { min: 1, max: 1000, default: 200 })!;
+      const positions = await getSectionPositions(ctx.client, sectionId, langArg(args));
+      const dimensions = new Map<number, { dimension_id: number; name: string; position_count: number }>();
+      for (const p of positions) {
+        const d = dimensions.get(p.dimensionId) ?? { dimension_id: p.dimensionId, name: p.dimensionName, position_count: 0 };
+        d.position_count++;
+        dimensions.set(p.dimensionId, d);
+      }
+      const filtered = positions
+        .filter((p) => dimensionId === undefined || p.dimensionId === dimensionId)
+        .filter((p) => matchesQuery(p.positionName, query));
+      const page = paginate(filtered, off, lim);
+      return {
+        section_id: sectionId,
+        dimensions: [...dimensions.values()].sort((a, b) => a.dimension_id - b.dimension_id),
+        positions: {
+          total: page.total,
+          offset: page.offset,
+          limit: page.limit,
+          next_offset: page.next_offset,
+          items: page.items.map((p) => ({
+            dimension_id: p.dimensionId,
+            dimension: p.dimensionName,
+            position_id: p.positionId,
+            name: p.positionName,
+            symbol: p.symbol,
+          })),
+        },
+      };
+    },
+  },
+  {
+    name: "estimate_data_size",
+    title: "Estimate data size",
+    description:
+      "Count the rows for a variable/section/year/period selection before downloading, and report how many pages " +
+      "and upstream requests a complete download needs and whether get_complete_data will accept it.",
+    inputSchema: schema(dataSelectors, dataRequired),
+    async handler(args, ctx) {
+      const req = await resolveDataRequest(ctx, args);
+      const total = await countRows(ctx, req);
+      const pages = Math.ceil(total / DBW_MAX_PAGE_SIZE);
+      const allowed = total > 0 && total <= MAX_COMPLETE_ROWS;
+      return {
+        ...requestSummary(req),
+        total_rows: total,
+        max_page_size: DBW_MAX_PAGE_SIZE,
+        pages_at_max_page_size: pages,
+        preview_rows: Math.min(total, PREVIEW_ROWS),
+        complete_retrieval: { allowed, row_limit: MAX_COMPLETE_ROWS, upstream_requests: pages },
+        recommendation: total === 0
+          ? "No data for this selection. Try another year or period."
+          : allowed
+          ? "Use preview_data to inspect, then get_complete_data (csv is most compact)."
+          : `Too large for one call. Use get_data_page with page_size ${DBW_MAX_PAGE_SIZE} for pages 0-${pages - 1}.`,
+      };
+    },
+  },
+  {
+    name: "preview_data",
+    title: "Preview data (first 1000 rows)",
+    description:
+      `Return up to the first ${PREVIEW_ROWS} decoded rows of a selection, with dimension, period, unit and ` +
+      "annotation codes translated to names, plus the total row count.",
+    inputSchema: schema({ ...dataSelectors, format: formatProp("json"), include_codes: includeCodes }, dataRequired),
+    async handler(args, ctx) {
+      const req = await resolveDataRequest(ctx, args);
+      const format = enumArg(args, "format", ["json", "csv"] as const, "json");
+      const { decode, dimensions } = await createDecoderFor(ctx, req, boolArg(args, "include_codes", false));
+      const { rows } = await fetchDataPage(ctx, req, 0, PREVIEW_ROWS);
+      const total = await countRows(ctx, req);
+      return {
+        ...requestSummary(req),
+        total_rows: total,
+        returned_rows: rows.length,
+        truncated: total > rows.length,
+        ...formatRows(rows.map(decode), format, dimensions),
+      };
+    },
+  },
+  {
+    name: "get_data_page",
+    title: "Get one page of data",
+    description:
+      "Return one page of decoded rows. Pages are 0-based; follow next_page until it is null. " +
+      `page_size up to ${DBW_MAX_PAGE_SIZE}.`,
+    inputSchema: schema({
+      ...dataSelectors,
+      page: { type: "integer", minimum: 0, default: 0, description: "0-based page number." },
+      page_size: {
+        type: "integer",
+        minimum: 1,
+        maximum: DBW_MAX_PAGE_SIZE,
+        default: 1000,
+        description: `Rows per page (1-${DBW_MAX_PAGE_SIZE}).`,
+      },
+      format: formatProp("json"),
+      include_codes: includeCodes,
+    }, dataRequired),
+    async handler(args, ctx) {
+      const req = await resolveDataRequest(ctx, args);
+      const page = intArg(args, "page", { min: 0, max: 100000, default: 0 })!;
+      const pageSize = intArg(args, "page_size", { min: 1, max: DBW_MAX_PAGE_SIZE, default: 1000 })!;
+      const format = enumArg(args, "format", ["json", "csv"] as const, "json");
+      const { decode, dimensions } = await createDecoderFor(ctx, req, boolArg(args, "include_codes", false));
+      const { rows, pageCount } = await fetchDataPage(ctx, req, page, pageSize);
+      return {
+        ...requestSummary(req),
+        page,
+        page_size: pageSize,
+        page_count: pageCount,
+        next_page: page + 1 < pageCount ? page + 1 : null,
+        returned_rows: rows.length,
+        ...formatRows(rows.map(decode), format, dimensions),
+      };
+    },
+  },
+  {
+    name: "get_complete_data",
+    title: "Get complete data",
+    description:
+      `Download every row of a selection in one call (up to ${MAX_COMPLETE_ROWS} rows), fetching all DBW pages ` +
+      "server-side. Larger selections are refused with instructions to use get_data_page. Run estimate_data_size first.",
+    inputSchema: schema({ ...dataSelectors, format: formatProp("csv"), include_codes: includeCodes }, dataRequired),
+    async handler(args, ctx) {
+      const req = await resolveDataRequest(ctx, args);
+      const format = enumArg(args, "format", ["json", "csv"] as const, "csv");
+      const total = await countRows(ctx, req);
+      if (total === 0) {
+        throw new ToolError("NO_DATA", "DBW has no data for this selection.", {
+          hint: "Try another year or period from list_sections_and_periods.",
+        });
+      }
+      const pages = Math.ceil(total / DBW_MAX_PAGE_SIZE);
+      if (total > MAX_COMPLETE_ROWS) {
+        throw new ToolError("TOO_LARGE", `This selection has ${total} rows; the limit for one call is ${MAX_COMPLETE_ROWS}.`, {
+          hint: `Use get_data_page with page_size ${DBW_MAX_PAGE_SIZE} for pages 0-${pages - 1} (csv format is most compact).`,
+        });
+      }
+      const { decode, dimensions } = await createDecoderFor(ctx, req, boolArg(args, "include_codes", false));
+      const decoded: DecodedRow[] = [];
+      for (let page = 0; page < pages; page++) {
+        const { rows } = await fetchDataPage(ctx, req, page, DBW_MAX_PAGE_SIZE);
+        for (const r of rows) decoded.push(decode(r));
+      }
+      return {
+        ...requestSummary(req),
+        total_rows: total,
+        returned_rows: decoded.length,
+        upstream_pages: pages,
+        complete: decoded.length === total,
+        ...(decoded.length !== total
+          ? { warning: `DBW reported ${total} rows but returned ${decoded.length}; the data may have changed during download.` }
+          : {}),
+        ...formatRows(decoded, format, dimensions),
+      };
+    },
+  },
+  {
+    name: "get_dictionary",
+    title: "Look up a DBW dictionary",
+    description:
+      "Look up DBW code dictionaries used when decoding data: periods, units (way of presentation / measure units), " +
+      "no_value markers, confidentiality markers, flags, and years.",
+    inputSchema: schema({
+      name: { type: "string", enum: [...DICTIONARY_NAMES], description: "Dictionary to read." },
+      query: { type: "string", description: "Words to match in entry names or symbols." },
+      offset,
+      limit: limit(100, 500),
+    }, ["name"]),
+    async handler(args, ctx) {
+      if (args.name === undefined) throw new ToolError("INVALID_ARGUMENT", '"name" is required.');
+      const name = enumArg(args, "name", DICTIONARY_NAMES, "periods");
+      const query = strArg(args, "query");
+      const off = intArg(args, "offset", { min: 0, default: 0 })!;
+      const lim = intArg(args, "limit", { min: 1, max: 500, default: 100 })!;
+      const entries = (await getDictionary(ctx.client, name, langArg(args)))
+        .filter((e) => matchesQuery(`${e.symbol} ${e.name}`, query));
+      const page = paginate(entries, off, lim);
+      return {
+        dictionary: name,
+        total: page.total,
+        offset: page.offset,
+        limit: page.limit,
+        next_offset: page.next_offset,
+        entries: page.items.map((e) => ({ id: e.id, symbol: e.symbol, name: e.name, ...(e.extra ?? {}) })),
+      };
+    },
+  },
+];

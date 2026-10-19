@@ -1,0 +1,14 @@
+{
+  "name": "dbw-mcp-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"supabase/functions/dbw-mcp/tests/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}

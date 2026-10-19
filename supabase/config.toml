@@ -1,0 +1,2 @@
+[functions.dbw-mcp]
+verify_jwt = false
