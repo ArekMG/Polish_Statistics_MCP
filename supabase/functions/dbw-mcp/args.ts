@@ -81,6 +81,10 @@ const SYNONYMS: Record<string, string[]> = {
   transport: ["transport"],
   environment: ["srodowisko"],
   demography: ["demografia"],
+  migration: ["migracje", "migracja"],
+  natural: ["ruch naturalny", "ruch"],
+  births: ["urodzenia", "urodzenie"],
+  deaths: ["zgony", "zgon"],
   housing: ["mieszkania", "budynki"],
 };
 
