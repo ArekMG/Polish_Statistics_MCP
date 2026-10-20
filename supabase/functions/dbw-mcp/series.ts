@@ -35,7 +35,7 @@ type SeriesResult = {
   storedAt: string;
 };
 
-const PRESENTATION_ARGS = new Set(["format", "include_executed", "dry_run", "force_refresh", "max_requests", "budget_strategy"]);
+const PRESENTATION_ARGS = new Set(["format", "include_executed", "dry_run", "force_refresh", "max_requests", "budget_strategy", "probe_uncached"]);
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -261,6 +261,7 @@ async function fetchCombination(ctx: ToolContext, req: DataRequest): Promise<Out
 
 function toWide(groups: { label: string; rows: DecodedRow[] }[], dimensions: string[]) {
   const columns = groups.map((g) => g.label);
+  const keyColumns = [...dimensions, "unit"];
   const table = new Map<string, Record<string, string | number | null>>();
   for (const g of groups) {
     for (const r of g.rows) {
@@ -275,7 +276,7 @@ function toWide(groups: { label: string; rows: DecodedRow[] }[], dimensions: str
       entry[g.label] = r.value;
     }
   }
-  return { columns, table: [...table.values()] };
+  return { columns, key_columns: keyColumns, table: [...table.values()] };
 }
 
 export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Record<string, unknown>> {
@@ -289,6 +290,7 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   const includeCodes = boolArg(args, "include_codes", false);
   const dryRun = boolArg(args, "dry_run", false);
   const forceRefresh = boolArg(args, "force_refresh", false);
+  const probeUncached = boolArg(args, "probe_uncached", false);
   const includeExecuted = boolArg(args, "include_executed", true);
   const maxRequests = intArg(args, "max_requests", { min: 1, max: 1000 });
   const budgetStrategy = enumArg(args, "budget_strategy", ["partial", "strict", "wait"] as const, "partial");
@@ -345,7 +347,9 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     const counts: Record<CoverageStatus, number> = { cached: 0, empty: 0, outside_range: 0, to_fetch: 0 };
     let estimated = 0;
     const inRange = combos.filter((c) => !outsideRange(c));
-    const plan = await planCoverage(ctx, inRange.map(requestFor));
+    const plan = probeUncached
+      ? inRange.map(() => ({ status: "to_fetch" as CoverageStatus, requests: 1 }))
+      : await planCoverage(ctx, inRange.map(requestFor));
     for (const c of combos) {
       const idx = inRange.indexOf(c);
       const cov: Coverage = idx === -1 ? { status: "outside_range", requests: 0 } : plan[idx];
@@ -516,6 +520,14 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       periods_expected_per_year: periods.length,
       allow_partial: aggregate.allowPartial,
       incomplete_groups: result.incomplete,
+      semantics: {
+        mean: "arithmetic average of all non-null period values in the year",
+        sum: "total of all non-null period values in the year",
+        min: "smallest non-null period value in the year",
+        max: "largest non-null period value in the year",
+        first: "value of the earliest period in calendar order (by period symbol, not input order)",
+        last: "value of the latest period in calendar order (by period symbol, not input order)",
+      }[aggregate.fn],
       note: aggregate.allowPartial
         ? "Incomplete years are computed from the available periods; check periods_used."
         : "Years missing any period have value null; set allow_partial: true to compute them anyway.",

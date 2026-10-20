@@ -57,10 +57,70 @@ export function normalizeText(s: string): string {
   return s.normalize("NFD").replace(/\p{Diacritic}/gu, "").replace(/ł/g, "l").replace(/Ł/g, "L").toLowerCase();
 }
 
+// Common Polish-English synonym pairs so searching in English finds Polish DBW names and vice versa.
+const SYNONYMS: Record<string, string[]> = {
+  unemployment: ["bezrobocie", "bezrobotni"],
+  employed: ["zatrudnieni", "pracujacy"],
+  employment: ["zatrudnienie", "praca"],
+  salary: ["wynagrodzenie", "placa"],
+  wages: ["wynagrodzenia", "place"],
+  population: ["ludnosc", "populacja"],
+  industry: ["przemysl"],
+  agriculture: ["rolnictwo"],
+  inflation: ["inflacja"],
+  prices: ["ceny", "cena"],
+  gdp: ["pkb"],
+  exports: ["eksport"],
+  imports: ["import"],
+  retail: ["handel", "detal"],
+  construction: ["budownictwo"],
+  tourism: ["turystyka"],
+  education: ["edukacja", " szkolnictwo"],
+  health: ["zdrowie"],
+  energy: ["energia", "paliwa"],
+  transport: ["transport"],
+  environment: ["srodowisko"],
+  demography: ["demografia"],
+  housing: ["mieszkania", "budynki"],
+};
+
+const REVERSE_SYNONYMS: Map<string, string> = (() => {
+  const m = new Map<string, string>();
+  for (const [en, plList] of Object.entries(SYNONYMS)) {
+    for (const pl of plList) {
+      m.set(normalizeText(pl), en);
+      m.set(normalizeText(pl).slice(0, Math.max(4, pl.length - 3)), en);
+    }
+  }
+  return m;
+})();
+
+function expandQuery(query: string): string[] {
+  const normalized = normalizeText(query);
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const expanded = new Set<string>([normalized]);
+  for (const word of words) {
+    const en = SYNONYMS[word];
+    if (en) for (const pl of en) {
+      const np = normalizeText(pl);
+      expanded.add(np);
+      expanded.add(stem(np));
+    }
+    const reverse = REVERSE_SYNONYMS.get(word) ?? REVERSE_SYNONYMS.get(stem(word));
+    if (reverse) {
+      expanded.add(reverse);
+      expanded.add(stem(reverse));
+    }
+  }
+  return [...expanded];
+}
+
 export function matchesQuery(text: string, query: string | undefined): boolean {
   if (!query) return true;
   const haystack = normalizeText(text);
-  return normalizeText(query).split(/\s+/).filter(Boolean).every((word) => haystack.includes(word));
+  return expandQuery(query).some((variant) =>
+    variant.split(/\s+/).filter(Boolean).every((word) => haystack.includes(word))
+  );
 }
 
 // Polish words inflect at the end (bezrobocie / bezrobotni, wynagrodzenia / wynagrodzenie), so loose matching
@@ -72,7 +132,9 @@ function stem(word: string): string {
 export function matchesLoosely(text: string, query: string | undefined): boolean {
   if (!query) return true;
   const haystack = normalizeText(text);
-  return normalizeText(query).split(/\s+/).filter(Boolean).every((word) => haystack.includes(stem(word)));
+  return expandQuery(query).some((variant) =>
+    variant.split(/\s+/).filter(Boolean).every((word) => haystack.includes(stem(word)))
+  );
 }
 
 export function intListArg(args: Args, name: string, options: { min: number; max: number; maxItems: number }) {

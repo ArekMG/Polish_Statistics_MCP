@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { matchesLoosely } from "../args.ts";
+import { matchesQuery } from "../args.ts";
 import { territorialLevel } from "../catalog.ts";
 import type { RateLimiter } from "../store.ts";
 import { allowAll, setup } from "./helpers.ts";
@@ -188,4 +189,41 @@ test("max_requests caps the number of DBW requests", async () => {
   assert.equal(out.truncated, true);
   assert.ok(out.pending.length > 0);
   assert.match(out.pending[0].reason, /max_requests/);
+});
+
+test("aggregation response includes semantics explaining what the fn computes", async () => {
+  const { call } = setup();
+  const out = (await call("get_data_series", { ...SERIES, levels: ["voivodeship"], position_ids: [50], aggregate: { fn: "last" } })).structuredContent;
+  assert.equal(out.aggregation.fn, "last");
+  assert.match(out.aggregation.semantics, /latest period/);
+});
+
+test("wide format includes key_columns", async () => {
+  const { call } = setup();
+  const out = (await call("get_data_series", { ...SERIES, levels: ["voivodeship"], position_ids: [50], format: "wide" })).structuredContent;
+  assert.ok(Array.isArray(out.key_columns));
+  assert.ok(out.key_columns.includes("unit"));
+});
+
+test("probe_uncached treats everything as to_fetch", async () => {
+  const { call } = setup();
+  await call("get_data_series", { ...SERIES, years: [2019] });
+  const plan = (await call("get_data_series", { ...SERIES, years: [2019], dry_run: true, probe_uncached: true })).structuredContent;
+  const label = plan.periods[0].period;
+  assert.equal(plan.coverage["2019"][label], "to_fetch");
+});
+
+test("quota_status includes error_codes catalog", async () => {
+  const { call } = setup();
+  const out = (await call("quota_status")).structuredContent;
+  assert.ok(out.error_codes);
+  assert.equal(out.error_codes.RATE_LIMITED, out.error_codes.RATE_LIMITED);
+  assert.ok(out.error_codes.BUDGET_EXHAUSTED);
+});
+
+test("search synonyms find Polish terms from English query", () => {
+  assert.ok(matchesQuery("Stopa bezrobocia", "unemployment"));
+  assert.ok(matchesQuery("Przeciętne wynagrodzenie", "salary"));
+  assert.ok(matchesQuery("Ludność", "population"));
+  assert.ok(matchesLoosely("Budownictwo", "construction"));
 });

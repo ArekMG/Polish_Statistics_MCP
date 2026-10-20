@@ -508,7 +508,8 @@ export const tools: ToolDefinition[] = [
       "so each combination costs at least one DBW request; downloaded combinations are cached for 6 hours and then cost " +
       "nothing. The reply lists executed, empty (no data, with reason) and pending combinations. If the request budget " +
       "runs out, partial results are returned with retry_after_seconds: call again with the same arguments to finish. " +
-      "format 'wide' returns one row per position with a column per year (or year+period). Use dry_run: true first to " +
+      "format 'wide' returns one row per position with a column per year (or year+period); key_columns lists the " +
+      "dimension columns plus 'unit' that uniquely identify each row. Use dry_run: true first to " + +
       "see a year x period coverage matrix (cached / empty / outside_range / to_fetch) and the exact number of DBW " +
       "requests the call would cost, without downloading anything. aggregate {fn, window: 'year'} returns yearly " +
       "mean/sum/min/max computed on the server, or first/last (e.g. last = state at the end of the year), with " +
@@ -561,6 +562,11 @@ export const tools: ToolDefinition[] = [
         type: "boolean",
         default: false,
         description: "Only plan: return the coverage matrix and the DBW request cost; downloads nothing.",
+      },
+      probe_uncached: {
+        type: "boolean",
+        default: false,
+        description: "With dry_run: treat every in-range combination as to_fetch (ignore the noData cache). Useful to estimate worst-case cost.",
       },
       force_refresh: {
         type: "boolean",
@@ -636,6 +642,19 @@ export const tools: ToolDefinition[] = [
         limits: buckets,
         cached_tools_available: CACHED_TOOLS,
         cache: cacheStats,
+        error_codes: {
+          INVALID_ARGUMENT: "A parameter is missing or has an invalid value.",
+          NOT_FOUND: "The variable, section, area, or position id does not exist in DBW.",
+          NO_DATA: "DBW has no data for this specific year/period/section combination.",
+          PAGE_OUT_OF_RANGE: "The requested page number does not exist for this selection.",
+          TOO_LARGE: "The selection exceeds the row limit (20000) for one call.",
+          RATE_LIMITED: "The DBW request budget is used up; retry after retry_after_seconds.",
+          BUDGET_EXHAUSTED: "budget_strategy 'strict' refused the call because estimated requests exceed remaining budget.",
+          UPSTREAM_ERROR: "DBW returned an error or unexpected response; usually temporary.",
+          UPSTREAM_TIMEOUT: "DBW did not respond within 30 seconds.",
+          INVALID_DBW_KEY: "DBW rejected the personal API key sent with the connection.",
+          INTERNAL_ERROR: "An unexpected server error occurred.",
+        },
         ...(ctx.client.registered ? {} : { upgrade_hint: "Provide a personal DBW API key (X-DBW-Key header) for a separate, larger request budget." }),
         note: ctx.client.registered
           ? "Your DBW key has its own request budget. Data already downloaded is cached for 6 hours and costs nothing."
