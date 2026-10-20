@@ -3,6 +3,7 @@ export interface Cache {
   set(key: string, value: unknown, ttlSeconds: number): Promise<void>;
   // Maps each cached key to the DBW "page-count" stored in it (null when absent); missing keys are not cached.
   presence(keys: string[]): Promise<Map<string, number | null>>;
+  stats(): Promise<{ entries: number; bytes: number }>;
 }
 
 // Hard cap on the total bytes of cached payloads. Enforced on every cache write and
@@ -101,6 +102,17 @@ export function createSupabaseStore(supabaseUrl: string, serviceKey: string, fet
         }
       } catch (err) {
         console.error("cache write error", err);
+      }
+    },
+    async stats() {
+      try {
+        const res = await fetchImpl(`${base}/rpc/mcp_cache_stats`, { method: "POST", headers });
+        if (!res.ok) return { entries: 0, bytes: 0 };
+        const out = await res.json() as { entries?: number; bytes?: number };
+        return { entries: Number(out.entries) || 0, bytes: Number(out.bytes) || 0 };
+      } catch (err) {
+        console.error("cache stats error", err);
+        return { entries: 0, bytes: 0 };
       }
     },
   };

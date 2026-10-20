@@ -47,6 +47,7 @@ export type QuotaBucket = {
 
 export type DbwClient = {
   registered: boolean;
+  keySource: "header" | "none";
   get<T>(path: string, params: Record<string, string | number>, lang: Lang, options?: DbwGetOptions): Promise<T>;
   tracked(): TrackedDbwClient;
   quota(): Promise<QuotaBucket[] | undefined>;
@@ -233,9 +234,12 @@ export function createDbwClient(options: DbwClientOptions): DbwClient {
     });
   }
 
+  const keySource: "header" | "none" = options.userKey ? "header" : "none";
+
   function build(onUpstream: () => void): DbwClient {
     return {
       registered,
+      keySource,
       get: <T>(path: string, params: Record<string, string | number>, lang: Lang, getOptions: DbwGetOptions = {}) =>
         request<T>(path, params, lang, getOptions, onUpstream),
       tracked,

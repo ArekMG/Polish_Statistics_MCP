@@ -5,6 +5,7 @@ export type ErrorCode =
   | "PAGE_OUT_OF_RANGE"
   | "TOO_LARGE"
   | "RATE_LIMITED"
+  | "BUDGET_EXHAUSTED"
   | "UPSTREAM_ERROR"
   | "UPSTREAM_TIMEOUT"
   | "INVALID_DBW_KEY"

@@ -31,9 +31,11 @@ type SeriesResult = {
   executed: Record<string, unknown>[];
   dimensions: string[];
   groups: Group[];
+  revision: string;
+  storedAt: string;
 };
 
-const PRESENTATION_ARGS = new Set(["format", "include_executed", "dry_run"]);
+const PRESENTATION_ARGS = new Set(["format", "include_executed", "dry_run", "force_refresh", "max_requests", "budget_strategy"]);
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -57,14 +59,19 @@ function present(
   fromCache: boolean,
 ): Record<string, unknown> {
   const decoded = result.groups.flatMap((g) => g.rows);
+  const totalRows = result.core.total_rows as number | undefined;
+  const truncated = Boolean(result.core.truncated);
   return {
     ...result.core,
     executed: includeExecuted ? result.executed : undefined,
     executed_count: result.executed.length,
     returned_rows: decoded.length,
+    ...(totalRows !== undefined ? { total_rows: totalRows } : {}),
+    truncated,
     format,
     dimensions: result.dimensions,
-    ...(fromCache ? { from_result_cache: true } : {}),
+    revision: result.revision,
+    ...(fromCache ? { from_result_cache: true, cache: { hit: true, stored_at: result.storedAt } } : { cache: { hit: false } }),
     ...(format === "csv"
       ? { csv: rowsToCsv(decoded, result.dimensions) }
       : format === "wide"
@@ -130,6 +137,27 @@ async function planCoverage(ctx: ToolContext, reqs: DataRequest[]): Promise<Cove
     const missing = extraKeys[i].filter((k) => !extraFound.has(k)).length;
     return { status: missing ? "to_fetch" : "cached", requests: missing };
   });
+}
+
+// Splits in-range combinations into chunks that fit within the remaining DBW request budget.
+function chunkCombos(combos: Combination[], budget: number): { years: number[]; period_ids: number[]; estimated_requests: number }[] {
+  const chunks: { years: Set<number>; period_ids: Set<number>; estimated_requests: number }[] = [];
+  let current = { years: new Set<number>(), period_ids: new Set<number>(), estimated_requests: 0 };
+  for (const c of combos) {
+    if (current.estimated_requests >= budget && current.years.size > 0) {
+      chunks.push(current);
+      current = { years: new Set<number>(), period_ids: new Set<number>(), estimated_requests: 0 };
+    }
+    current.years.add(c.year);
+    current.period_ids.add(c.periodId);
+    current.estimated_requests++;
+  }
+  if (current.years.size > 0) chunks.push(current);
+  return chunks.map((c) => ({
+    years: [...c.years].sort((a, b) => a - b),
+    period_ids: [...c.period_ids].sort((a, b) => a - b),
+    estimated_requests: c.estimated_requests,
+  }));
 }
 
 function isAnnualPeriod(p: { symbol: string; name: string }) {
@@ -260,13 +288,16 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   const format = enumArg(args, "format", ["json", "csv", "wide"] as const, "json");
   const includeCodes = boolArg(args, "include_codes", false);
   const dryRun = boolArg(args, "dry_run", false);
+  const forceRefresh = boolArg(args, "force_refresh", false);
   const includeExecuted = boolArg(args, "include_executed", true);
+  const maxRequests = intArg(args, "max_requests", { min: 1, max: 1000 });
+  const budgetStrategy = enumArg(args, "budget_strategy", ["partial", "strict", "wait"] as const, "partial");
   const aggregate = parseAggregate(args);
   const rounding = parseRounding(args);
   const lang = langArg(args);
 
   const resultKey = dryRun ? undefined : await resultCacheKey(args, lang);
-  const hit = resultKey ? await ctx.cache.get<SeriesResult>(resultKey) : undefined;
+  const hit = (!forceRefresh && resultKey) ? await ctx.cache.get<SeriesResult>(resultKey) : undefined;
   if (hit?.core && Array.isArray(hit.groups) && Array.isArray(hit.executed)) {
     return present(hit, format, includeExecuted, true);
   }
@@ -349,8 +380,32 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       ...(tightest
         ? { fits_in_budget: estimated <= tightest.remaining, tightest_limit: tightest }
         : {}),
+      ...(tightest && estimated > tightest.remaining
+        ? {
+            chunks: chunkCombos(combos.filter((c) => !outsideRange(c)), tightest.remaining),
+            budget_strategy_hint: `estimated ${estimated} > remaining ${tightest.remaining}; use budget_strategy "strict" to refuse, or split into chunks.`,
+          }
+        : {}),
       ...(annualWarning ? { warning: annualWarning } : {}),
     };
+  }
+
+  // strict: refuse before fetching if the estimated cost exceeds the remaining budget.
+  if (!dryRun && budgetStrategy === "strict") {
+    const quota = await ctx.client.quota();
+    const tightest = quota?.filter((q) => q.window_seconds > 1).sort((a, b) => a.remaining - b.remaining)[0];
+    if (tightest) {
+      const inRange = combos.filter((c) => !outsideRange(c));
+      const plan = await planCoverage(ctx, inRange.map(requestFor));
+      const estimated = plan.reduce((s, c) => s + c.requests, 0);
+      if (estimated > tightest.remaining) {
+        throw new ToolError("BUDGET_EXHAUSTED", `Estimated ${estimated} DBW requests but only ${tightest.remaining} remaining (limit "${tightest.limit_id}").`, {
+          retryAfterSeconds: tightest.reset_after_seconds,
+          hint: 'Use budget_strategy "partial" to fetch what fits, or wait for the budget to reset.',
+          details: { limit_id: tightest.limit_id, estimated, remaining: tightest.remaining },
+        });
+      }
+    }
   }
 
   const outcomes: Outcome[] = new Array(combos.length);
@@ -359,6 +414,7 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   let rateError: ToolError | undefined;
   let keptRows = 0;
   const started = Date.now();
+  let requestsUsed = 0;
   let next = 0;
 
   async function worker() {
@@ -377,6 +433,10 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
         outcomes[i] = { status: "pending", reason: "request budget used up" };
         continue;
       }
+      if (maxRequests && requestsUsed >= maxRequests) {
+        outcomes[i] = { status: "pending", reason: `max_requests limit of ${maxRequests} reached` };
+        continue;
+      }
       if (Date.now() - started > TIME_BUDGET_MS) {
         outcomes[i] = { status: "pending", reason: "time limit for one call reached" };
         continue;
@@ -387,7 +447,9 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       }
       const req = requestFor(c);
       try {
+        requestsUsed++;
         const out = await fetchCombination(ctx, req);
+        if (out.status !== "ok") requestsUsed--;
         if (out.status === "ok" && keep) out.rows = out.rows.filter(keep);
         if (out.status === "ok") keptRows += out.rows.length;
         outcomes[i] = out;
@@ -422,10 +484,14 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
   });
 
   if (rateError && executed.length === 0 && empty.length === 0) throw rateError;
+  const truncated = pending.length > 0 || keptRows > MAX_COMPLETE_ROWS;
   if (keptRows > MAX_COMPLETE_ROWS) {
-    throw new ToolError("TOO_LARGE", `The selection has more than ${MAX_COMPLETE_ROWS} rows after filtering.`, {
-      hint: "Narrow it with levels, position_ids, fewer years or fewer periods.",
-    });
+    if (format === "wide") {
+      throw new ToolError("TOO_LARGE", `The selection has more than ${MAX_COMPLETE_ROWS} rows after filtering.`, {
+        hint: "Narrow it with levels, position_ids, fewer years or fewer periods, or use format json/csv.",
+      });
+    }
+    // For json/csv, return what we have with truncated=true and a hint instead of throwing.
   }
 
   let outputGroups: Group[] = groups;
@@ -473,7 +539,9 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
       position_ids: positionIds ?? null,
       levels: levels ? [...levels] : null,
     },
-    complete: pending.length === 0,
+    complete: pending.length === 0 && keptRows <= MAX_COMPLETE_ROWS,
+    truncated,
+    total_rows: pending.length === 0 ? keptRows : undefined,
     empty,
     pending,
     ...(pending.length
@@ -493,7 +561,9 @@ export async function getDataSeries(args: Args, ctx: ToolContext): Promise<Recor
     },
   };
 
-  const result: SeriesResult = { core, executed, dimensions, groups: outputGroups };
+  const revision = await sha256Hex(stableJson({ core: Object.fromEntries(Object.entries(core).filter(([k]) => k !== "pending" && k !== "complete")), groups: outputGroups.map((g) => [g.label, g.rows.length]) }));
+  const storedAt = new Date().toISOString();
+  const result: SeriesResult = { core, executed, dimensions, groups: outputGroups, revision, storedAt };
   if (resultKey && pending.length === 0) await ctx.cache.set(resultKey, result, DATA_TTL);
   return present(result, format, includeExecuted, false);
 }

@@ -21,6 +21,7 @@ export function memoryCache(): Cache & { store: Map<string, unknown> } {
       store.set(key, structuredClone(value));
       return Promise.resolve();
     },
+    stats: () => Promise.resolve({ entries: store.size, bytes: 0 }),
   };
 }
 

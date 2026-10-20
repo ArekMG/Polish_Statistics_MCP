@@ -98,6 +98,94 @@ test("quota_status reports remaining budget without using it", async () => {
   const res = await call("quota_status");
   const out = res.structuredContent;
   assert.equal(out.authenticated, false);
+  assert.equal(out.shared, true);
+  assert.equal(out.key_source, "none");
+  assert.ok(out.upgrade_hint !== undefined);
+  assert.ok("cache" in out);
   assert.ok(out.limits.some((l: { remaining: number; limit: number }) => l.limit === 90 && l.remaining === 90));
   assert.equal(dbw.calls.length, 0);
+});
+
+test("get_data_series returns total_rows and truncated for complete results", async () => {
+  const { call } = setup();
+  const out = (await call("get_data_series", { ...SERIES, years: [2019] })).structuredContent;
+  assert.equal(out.complete, true);
+  assert.equal(out.truncated, false);
+  assert.equal(out.total_rows, out.returned_rows);
+  assert.ok(out.revision);
+  assert.equal(out.cache.hit, false);
+});
+
+test("get_data_series returns truncated=true and no total_rows for partial results", async () => {
+  let open = true;
+  const dbwLimiter: RateLimiter = {
+    consume: () => Promise.resolve(open ? { allowed: true } : { allowed: false, bucket: "dbw-anon:15m", retryAfterSeconds: 120 }),
+    peek: allowAll.peek,
+  };
+  const { call } = setup({ dbwLimiter });
+  await call("get_data_series", { ...SERIES, years: [2019] });
+  open = false;
+  const partial = (await call("get_data_series", SERIES)).structuredContent;
+  assert.equal(partial.truncated, true);
+  assert.equal(partial.total_rows, undefined);
+});
+
+test("force_refresh bypasses the result cache", async () => {
+  const { call } = setup();
+  await call("get_data_series", { ...SERIES, years: [2019] });
+  const cached = (await call("get_data_series", { ...SERIES, years: [2019] })).structuredContent;
+  assert.equal(cached.cache.hit, true);
+  const forced = (await call("get_data_series", { ...SERIES, years: [2019], force_refresh: true })).structuredContent;
+  assert.equal(forced.cache.hit, false);
+});
+
+test("result cache hit returns revision and cache metadata", async () => {
+  const { call, dbw } = setup();
+  const first = (await call("get_data_series", { ...SERIES, years: [2019] })).structuredContent;
+  const callsBefore = dbw.calls.length;
+  const again = (await call("get_data_series", { ...SERIES, years: [2019] })).structuredContent;
+  assert.equal(again.cache.hit, true);
+  assert.ok(again.cache.stored_at);
+  assert.equal(again.revision, first.revision);
+  assert.equal(dbw.calls.length, callsBefore);
+});
+
+test("get_section_dimensions exposes is_current and validity dates", async () => {
+  const { call } = setup();
+  const res = await call("get_section_dimensions", { section_id: 1164, level: "voivodeship" });
+  const items = res.structuredContent.positions.items;
+  assert.ok(items.every((p: { is_current: boolean }) => p.is_current === true));
+  assert.ok(items[0].level_name);
+});
+
+test("budget_strategy strict refuses when estimated exceeds remaining", async () => {
+  const dbwLimiter: RateLimiter = {
+    consume: () => Promise.resolve({ allowed: true }),
+    peek: () => Promise.resolve([{ bucket: "dbw-anon:15m", hits: 89, resetAfterSeconds: 120 }]),
+  };
+  const { call } = setup({ dbwLimiter });
+  const result = await call("get_data_series", { ...SERIES, budget_strategy: "strict" });
+  assert.equal(result.structuredContent.error.code, "BUDGET_EXHAUSTED");
+  assert.ok(result.structuredContent.error.retry_after_seconds);
+});
+
+test("dry_run shows chunks when estimated exceeds remaining", async () => {
+  const dbwLimiter: RateLimiter = {
+    consume: () => Promise.resolve({ allowed: true }),
+    peek: () => Promise.resolve([{ bucket: "dbw-anon:15m", hits: 89, resetAfterSeconds: 120 }]),
+  };
+  const { call } = setup({ dbwLimiter });
+  const plan = (await call("get_data_series", { ...SERIES, dry_run: true })).structuredContent;
+  assert.equal(plan.fits_in_budget, false);
+  assert.ok(Array.isArray(plan.chunks));
+  assert.ok(plan.budget_strategy_hint);
+});
+
+test("max_requests caps the number of DBW requests", async () => {
+  const { call } = setup();
+  const out = (await call("get_data_series", { ...SERIES, max_requests: 1 })).structuredContent;
+  assert.equal(out.complete, false);
+  assert.equal(out.truncated, true);
+  assert.ok(out.pending.length > 0);
+  assert.match(out.pending[0].reason, /max_requests/);
 });

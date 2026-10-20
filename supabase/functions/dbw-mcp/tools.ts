@@ -15,6 +15,7 @@ import {
   getAreaVariables,
   getCatalog,
   getSectionPositions,
+  type SectionPosition,
   getVariableMeta,
   TERRITORIAL_LEVELS,
 } from "./catalog.ts";
@@ -308,12 +309,15 @@ export const tools: ToolDefinition[] = [
     description:
       "List the dimensions of a section (e.g. Sex, Voivodeship, Age group) and their positions (categories). " +
       "Territorial positions carry a level (poland, macroregion, voivodeship, region, subregion, county, " +
-      "municipality) derived from the official unit code. Positions are paginated; filter with dimension_id, level or query.",
+      "municipality) derived from the official unit code, plus validity dates (valid_from, valid_to, is_current). " +
+      "Positions with a valid_to in the past are historical; by default only current positions are returned. " +
+      "Positions are paginated; filter with dimension_id, level or query.",
     inputSchema: schema({
       section_id: dataSelectors.section_id,
       dimension_id: id("Only return positions of this dimension."),
       level: { type: "string", enum: [...TERRITORIAL_LEVELS], description: "Only return territorial positions of this level." },
       query: { type: "string", description: "Words to match in position names." },
+      include_historical: { type: "boolean", default: false, description: "Include historical positions (valid_to in the past). Default: only current." },
       offset,
       limit: limit(200, 1000),
     }, ["section_id"]),
@@ -322,14 +326,18 @@ export const tools: ToolDefinition[] = [
       const dimensionId = intArg(args, "dimension_id", { min: 1 });
       const level = args.level === undefined ? undefined : enumArg(args, "level", TERRITORIAL_LEVELS, "poland");
       const query = strArg(args, "query");
+      const includeHistorical = boolArg(args, "include_historical", false);
       const off = intArg(args, "offset", { min: 0, default: 0 })!;
       const lim = intArg(args, "limit", { min: 1, max: 1000, default: 200 })!;
+      const now = new Date().toISOString();
+      const isCurrent = (p: SectionPosition) => !p.validTo || p.validTo >= now;
       const positions = await getSectionPositions(ctx.client, sectionId, langArg(args));
       const dimensions = new Map<
         number,
         { dimension_id: number; name: string; position_count: number; levels?: Record<string, number> }
       >();
       for (const p of positions) {
+        if (!includeHistorical && !isCurrent(p)) continue;
         const d = dimensions.get(p.dimensionId) ?? { dimension_id: p.dimensionId, name: p.dimensionName, position_count: 0 };
         d.position_count++;
         if (p.level) {
@@ -339,6 +347,7 @@ export const tools: ToolDefinition[] = [
         dimensions.set(p.dimensionId, d);
       }
       const filtered = positions
+        .filter((p) => includeHistorical || isCurrent(p))
         .filter((p) => dimensionId === undefined || p.dimensionId === dimensionId)
         .filter((p) => level === undefined || p.level === level)
         .filter((p) => matchesQuery(p.positionName, query));
@@ -357,7 +366,10 @@ export const tools: ToolDefinition[] = [
             position_id: p.positionId,
             name: p.positionName,
             symbol: p.symbol,
-            ...(p.level ? { level: p.level } : {}),
+            ...(p.level ? { level: p.level, level_name: p.level } : {}),
+            ...(p.validFrom ? { valid_from: p.validFrom } : {}),
+            ...(p.validTo ? { valid_to: p.validTo } : {}),
+            is_current: isCurrent(p),
           })),
         },
       };
@@ -550,6 +562,23 @@ export const tools: ToolDefinition[] = [
         default: false,
         description: "Only plan: return the coverage matrix and the DBW request cost; downloads nothing.",
       },
+      force_refresh: {
+        type: "boolean",
+        default: false,
+        description: "Skip the result cache and re-download from DBW. Useful when data may have been updated.",
+      },
+      max_requests: {
+        type: "integer",
+        minimum: 1,
+        maximum: 1000,
+        description: "Cap the number of DBW data requests this call can make. Combinations beyond the cap are returned as pending.",
+      },
+      budget_strategy: {
+        type: "string",
+        enum: ["partial", "strict", "wait"],
+        default: "partial",
+        description: '"partial" fetches what fits and returns pending for the rest; "strict" refuses with BUDGET_EXHAUSTED if estimated > remaining; "wait" is not yet implemented.',
+      },
       include_executed: {
         type: "boolean",
         default: true,
@@ -599,12 +628,18 @@ export const tools: ToolDefinition[] = [
       if (!buckets) {
         throw new ToolError("UPSTREAM_ERROR", "The request budget could not be read right now.", { hint: "Retry shortly." });
       }
+      const cacheStats = await ctx.cache.stats();
       return {
         authenticated: ctx.client.registered,
-        shared: true,
+        shared: !ctx.client.registered,
+        key_source: ctx.client.keySource,
         limits: buckets,
         cached_tools_available: CACHED_TOOLS,
-        note: "The budget is shared by everyone using this server. Data already downloaded is cached for 6 hours and costs nothing.",
+        cache: cacheStats,
+        ...(ctx.client.registered ? {} : { upgrade_hint: "Provide a personal DBW API key (X-DBW-Key header) for a separate, larger request budget." }),
+        note: ctx.client.registered
+          ? "Your DBW key has its own request budget. Data already downloaded is cached for 6 hours and costs nothing."
+          : "The budget is shared by everyone using this server without a personal DBW key. Data already downloaded is cached for 6 hours and costs nothing.",
       };
     },
   },
