@@ -47,10 +47,17 @@ test("cache reads unexpired rows and upserts with a TTL", async () => {
   assert.match(rec.calls[0].url, /cache_key=eq\.dbw%7C%2Fx%3Fa%3D1&expires_at=gt\./);
 
   await cache.set("k", { v: 2 }, 60);
-  const body = JSON.parse(String(rec.calls[1].init?.body));
+  const write = rec.calls[1];
+  assert.equal(write.url, "https://db.example/rest/v1/mcp_dbw_cache?on_conflict=cache_key");
+  const body = JSON.parse(String(write.init?.body));
   assert.equal(body.cache_key, "k");
   assert.ok(Date.parse(body.expires_at) > Date.now() + 50_000);
-  assert.match((rec.calls[1].init?.headers as Record<string, string>).Prefer, /merge-duplicates/);
+  assert.match((write.init?.headers as Record<string, string>).Prefer, /merge-duplicates/);
+
+  // Every write trims the table to the hard byte cap so it can never grow unbounded.
+  const trim = rec.calls[2];
+  assert.equal(trim.url, "https://db.example/rest/v1/rpc/mcp_trim_cache");
+  assert.deepEqual(JSON.parse(String(trim.init?.body)), { p_max_bytes: 100 * 1024 * 1024 });
 });
 
 test("database failures fail open instead of breaking the server", async () => {

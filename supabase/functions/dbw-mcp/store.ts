@@ -5,6 +5,10 @@ export interface Cache {
   presence(keys: string[]): Promise<Map<string, number | null>>;
 }
 
+// Hard cap on the total bytes of cached payloads. Enforced on every cache write and
+// occasionally on the rate-limit path. When exceeded, the oldest rows are evicted first.
+export const CACHE_BUDGET_BYTES = 100 * 1024 * 1024;
+
 export type RateRule = { bucket: string; windowSeconds: number; limit: number };
 
 export type RateDecision =
@@ -84,6 +88,17 @@ export function createSupabaseStore(supabaseUrl: string, serviceKey: string, fet
           }),
         });
         if (!res.ok) console.error("cache write failed", res.status);
+        // Enforce the hard size cap on every write so the table can never grow unbounded,
+        // even under a burst of distinct queries that never hits the rate-limit cleanup path.
+        try {
+          await fetchImpl(`${base}/rpc/mcp_trim_cache`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ p_max_bytes: CACHE_BUDGET_BYTES }),
+          });
+        } catch (err) {
+          console.error("cache trim error", err);
+        }
       } catch (err) {
         console.error("cache write error", err);
       }
