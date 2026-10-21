@@ -10,7 +10,8 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "jsx": "react-jsx"
   },
-  "include": ["supabase/functions/**/*.ts", "types/*.d.ts"]
+  "include": ["*.tsx", "*.ts", "src/**/*.tsx", "src/**/*.ts"]
 }
